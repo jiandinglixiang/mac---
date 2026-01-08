@@ -1,6 +1,23 @@
 import Cocoa
 import ApplicationServices
 
+// MARK: - 透明毛玻璃背景视图（不拦截鼠标事件）
+final class PassthroughVisualEffectView: NSVisualEffectView {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}
+
+// MARK: - NSView 工具：向上查找某种类型的父视图
+extension NSView {
+    func enclosingView<T: NSView>(ofType type: T.Type) -> T? {
+        var view: NSView? = self
+        while let current = view {
+            if let typed = current as? T { return typed }
+            view = current.superview
+        }
+        return nil
+    }
+}
+
 // MARK: - 自定义窗口类（允许无边框窗口接收键盘事件）
 class KeyableWindow: NSWindow {
     override var canBecomeKey: Bool {
@@ -16,6 +33,7 @@ class HistoryWindowController: NSWindowController, NSWindowDelegate {
     private var window_: NSWindow?
     private var scrollView: NSScrollView!
     private var containerView: NSView!
+    private var backgroundEffectView: NSVisualEffectView?
     private var items: [ClipboardItem] = []
     private var itemViews: [ClipboardItemView] = []
     private var selectedIndex: Int = 0
@@ -23,6 +41,7 @@ class HistoryWindowController: NSWindowController, NSWindowDelegate {
     private let singleClickPasteKey = "singleClickPasteEnabled"
     private let preserveClipboardAfterPasteKey = "preserveClipboardAfterPasteEnabled"
     private let keyboardNavigatePasteKey = "keyboardNavigatePasteEnabled"
+    private var appearanceObserver: NSObjectProtocol?
     
     override var window: NSWindow? {
         get { return window_ }
@@ -32,10 +51,18 @@ class HistoryWindowController: NSWindowController, NSWindowDelegate {
     init() {
         super.init(window: nil)
         setupWindow()
+        startObservingAppearanceSettings()
+        applyAppearanceSettings()
     }
     
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
+    }
+
+    deinit {
+        if let appearanceObserver {
+            NotificationCenter.default.removeObserver(appearanceObserver)
+        }
     }
     
     private func setupWindow() {
@@ -61,7 +88,8 @@ class HistoryWindowController: NSWindowController, NSWindowDelegate {
         )
         
         window.isOpaque = false
-        window.backgroundColor = NSColor.black.withAlphaComponent(0.95)
+        // 使用透明背景，真正的背景由 NSVisualEffectView（毛玻璃）提供
+        window.backgroundColor = .clear
         window.level = .floating
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         window.isReleasedWhenClosed = false
@@ -71,9 +99,18 @@ class HistoryWindowController: NSWindowController, NSWindowDelegate {
         // 创建主容器
         let contentView = ClickThroughView(frame: window.contentView!.bounds)
         contentView.wantsLayer = true
-        contentView.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.95).cgColor
+        contentView.layer?.backgroundColor = NSColor.clear.cgColor
         contentView.windowController = self
         window.contentView = contentView
+
+        // 背景毛玻璃（铺满整个窗口，放在最底层）
+        let effectView = NSVisualEffectView(frame: contentView.bounds)
+        effectView.autoresizingMask = [.width, .height]
+        effectView.blendingMode = .behindWindow
+        effectView.material = .hudWindow
+        effectView.state = .active
+        contentView.addSubview(effectView, positioned: .below, relativeTo: nil)
+        self.backgroundEffectView = effectView
         
         // 创建自定义横向滚动视图（占据整个窗口）
         scrollView = HorizontalScrollView(frame: NSRect(
@@ -82,6 +119,7 @@ class HistoryWindowController: NSWindowController, NSWindowDelegate {
             width: screenFrame.width,
             height: windowHeight
         ))
+        scrollView.autoresizingMask = [.width, .height]
         
         // 替换默认的 clipView 为自定义的
         let customClipView = HorizontalClipView(frame: scrollView.contentView.frame)
@@ -113,8 +151,46 @@ class HistoryWindowController: NSWindowController, NSWindowDelegate {
         
         self.window_ = window
     }
+
+    private func startObservingAppearanceSettings() {
+        appearanceObserver = NotificationCenter.default.addObserver(
+            forName: .appearanceSettingsDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.applyAppearanceSettings()
+        }
+    }
+
+    private func applyAppearanceSettings() {
+        // 只调背景毛玻璃的透明度，避免整体窗口（包括文字）一起变透明
+        backgroundEffectView?.alphaValue = AppearanceSettings.historyBackgroundAlpha
+        itemViews.forEach { $0.applyCardAppearanceSettings() }
+    }
+    
+    private func updateWindowPosition() {
+        let mouseLocation = NSEvent.mouseLocation
+        // 找到包含鼠标的屏幕，如果找不到则默认使用主屏幕
+        let screen = NSScreen.screens.first(where: { NSMouseInRect(mouseLocation, $0.frame, false) }) ?? NSScreen.main
+        
+        guard let targetScreen = screen else { return }
+        
+        let screenFrame = targetScreen.visibleFrame
+        // 保持高度比例为屏幕高度的 20%
+        let windowHeight = screenFrame.height * 0.2
+        
+        let newFrame = NSRect(
+            x: screenFrame.minX,
+            y: screenFrame.minY,
+            width: screenFrame.width,
+            height: windowHeight
+        )
+        
+        window?.setFrame(newFrame, display: true)
+    }
     
     func showWindow(_ items: [ClipboardItem], previousActiveApp: NSRunningApplication?) {
+        updateWindowPosition()
         self.items = items
         self.selectedIndex = 0
 
@@ -185,6 +261,8 @@ class HistoryWindowController: NSWindowController, NSWindowDelegate {
         // 更新容器视图宽度
         let totalWidth = leftPadding + CGFloat(items.count) * (itemWidth + itemSpacing) + leftPadding
         containerView.frame.size.width = max(totalWidth, scrollView.frame.width)
+
+        applyAppearanceSettings()
     }
     
     private func handleItemClick(at index: Int) {
@@ -470,8 +548,8 @@ class ClickThroughView: NSView {
         let location = event.locationInWindow
         let hitView = self.hitTest(location)
         
-        // 如果点击的不是卡片视图，则隐藏窗口
-        if !(hitView is ClipboardItemView) && hitView != nil {
+        // 如果点击点不在任何卡片（包含卡片子视图）上，则隐藏窗口
+        if let hitView, hitView.enclosingView(ofType: ClipboardItemView.self) == nil {
             windowController?.hideWindow()
         } else {
             super.mouseDown(with: event)
@@ -486,12 +564,15 @@ class ClickThroughView: NSView {
 
 // MARK: - 自定义横向项目视图
 class ClipboardItemView: NSView {
+    private let backgroundView = PassthroughVisualEffectView()
     private let iconImageView = NSImageView()
+    private let thumbnailImageView = NSView() // 修改：使用普通 NSView 配合 Layer 显示图片
     private let titleLabel = NSTextField(labelWithString: "")
     private let previewLabel = NSTextField(labelWithString: "")
     private let timeLabel = NSTextField(labelWithString: "")
-    private let indexBadge = NSView()
-    private let indexLabel = NSTextField(labelWithString: "")
+    // 序号组件已移除
+    // private let indexBadge = NSView()
+    // private let indexLabel = NSTextField(labelWithString: "")
     private var isSelected = false
     var onClick: (() -> Void)?
     var onDoubleClick: (() -> Void)?
@@ -509,21 +590,32 @@ class ClipboardItemView: NSView {
     
     private func setupViews() {
         wantsLayer = true
-        layer?.backgroundColor = NSColor(white: 0.15, alpha: 0.9).cgColor
-        layer?.cornerRadius = 10
-        layer?.borderWidth = 1.5
-        layer?.borderColor = NSColor(white: 0.3, alpha: 0.5).cgColor
-        
-        // 添加微妙的阴影效果
+        // 外层只负责阴影（不做裁剪），内层 backgroundView 负责毛玻璃+圆角+描边
         layer?.shadowColor = NSColor.black.cgColor
         layer?.shadowOpacity = 0.3
         layer?.shadowOffset = CGSize(width: 0, height: -2)
         layer?.shadowRadius = 4
+
+        backgroundView.frame = bounds
+        backgroundView.autoresizingMask = [.width, .height]
+        backgroundView.blendingMode = .withinWindow
+        backgroundView.material = .underWindowBackground
+        backgroundView.state = .active
+        backgroundView.wantsLayer = true
+        backgroundView.layer?.cornerRadius = 10
+        backgroundView.layer?.masksToBounds = true
+        backgroundView.layer?.borderWidth = 1.0
+        backgroundView.layer?.borderColor = NSColor.white.withAlphaComponent(0.18).cgColor
+        addSubview(backgroundView)
+
+        applyCardAppearanceSettings()
         
         let padding: CGFloat = 10
         let headerHeight: CGFloat = 36
         let footerHeight: CGFloat = 22
         
+        // 序号组件已移除
+        /*
         // 序号徽章（左上角圆形背景）
         indexBadge.frame = NSRect(x: padding, y: frame.height - headerHeight, width: 24, height: 24)
         indexBadge.wantsLayer = true
@@ -539,15 +631,18 @@ class ClipboardItemView: NSView {
         indexLabel.isBezeled = false
         indexLabel.drawsBackground = false
         indexBadge.addSubview(indexLabel)
+        */
         
-        // 图标
+        // 图标 - 居左排列 (padding)
         let iconSize: CGFloat = 28
-        iconImageView.frame = NSRect(x: padding + 30, y: frame.height - headerHeight + 2, width: iconSize, height: iconSize)
+        iconImageView.frame = NSRect(x: padding, y: frame.height - headerHeight + 2, width: iconSize, height: iconSize)
         iconImageView.imageScaling = .scaleProportionallyUpOrDown
         addSubview(iconImageView)
         
         // 标题（单行，在图标右侧）
-        titleLabel.frame = NSRect(x: padding + 64, y: frame.height - headerHeight + 4, width: frame.width - padding - 70, height: 20)
+        // padding + iconSize + spacing (8)
+        let titleX = padding + iconSize + 8
+        titleLabel.frame = NSRect(x: titleX, y: frame.height - headerHeight + 4, width: frame.width - titleX - padding, height: 20)
         titleLabel.font = .systemFont(ofSize: 12, weight: .semibold)
         titleLabel.textColor = .white
         titleLabel.lineBreakMode = .byTruncatingTail
@@ -570,6 +665,16 @@ class ClipboardItemView: NSView {
         previewLabel.cell?.truncatesLastVisibleLine = true
         addSubview(previewLabel)
         
+        // 预览图片视图（用于显示图片类型的缩略图，位置同 previewLabel）
+        thumbnailImageView.frame = previewLabel.frame
+        // 使用 Layer 的 resizeAspectFill 来实现“只保证图片的短边能完全显示出来”（即 Aspect Fill）
+        thumbnailImageView.wantsLayer = true
+        thumbnailImageView.layer?.contentsGravity = .resizeAspectFill
+        thumbnailImageView.layer?.masksToBounds = true
+        thumbnailImageView.layer?.cornerRadius = 4
+        thumbnailImageView.isHidden = true
+        addSubview(thumbnailImageView)
+        
         // 时间标签（底部右侧）
         timeLabel.frame = NSRect(x: padding, y: 4, width: frame.width - (padding * 2), height: 16)
         timeLabel.font = .systemFont(ofSize: 9, weight: .medium)
@@ -579,6 +684,11 @@ class ClipboardItemView: NSView {
         timeLabel.drawsBackground = false
         addSubview(timeLabel)
     }
+
+    func applyCardAppearanceSettings() {
+        // 仅影响卡片背景（毛玻璃）本身，不影响文字/图标
+        backgroundView.alphaValue = AppearanceSettings.cardBackgroundAlpha
+    }
     
     func configure(with item: ClipboardItem, index: Int) {
         iconImageView.image = item.icon
@@ -587,23 +697,34 @@ class ClipboardItemView: NSView {
         let previewText = item.previewText
         previewLabel.stringValue = previewText
         timeLabel.stringValue = item.formattedTime
-        indexLabel.stringValue = "\(index + 1)"
+        // indexLabel.stringValue = "\(index + 1)" // 移除序号
+        
+        // 确保图标位置正确（因为之前可能被修改过）
+        let padding: CGFloat = 10
+        let headerHeight: CGFloat = 36
+        let iconSize: CGFloat = 28
+        iconImageView.frame = NSRect(x: padding, y: frame.height - headerHeight + 2, width: iconSize, height: iconSize)
         
         // 如果是图片，调整预览显示
         if item.type == .image {
-            // 图片类型使用更大的图标显示缩略图
-            let padding: CGFloat = 10
-            let headerHeight: CGFloat = 36
-            let footerHeight: CGFloat = 22
-            let previewY = footerHeight + 4
-            let previewHeight = frame.height - headerHeight - footerHeight - 8
-            
-            // 将预览区域用于显示图片缩略图
-            iconImageView.frame = NSRect(x: padding, y: previewY, width: frame.width - (padding * 2), height: previewHeight)
-            iconImageView.imageScaling = .scaleProportionallyDown
             previewLabel.isHidden = true
+            thumbnailImageView.isHidden = false
+            // 使用 imageData 显示大图预览
+            if let data = item.imageData, let image = NSImage(data: data) {
+                // 使用 layer.contents 配合 resizeAspectFill 实现填充裁剪效果
+                // 必须使用 cgImage 赋值给 layer.contents，NSImage 直接赋值可能无效
+                var imageRect = CGRect(origin: .zero, size: image.size)
+                if let cgImage = image.cgImage(forProposedRect: &imageRect, context: nil, hints: nil) {
+                    thumbnailImageView.layer?.contents = cgImage
+                } else {
+                    thumbnailImageView.layer?.contents = nil
+                }
+            } else {
+                thumbnailImageView.layer?.contents = nil
+            }
         } else {
             previewLabel.isHidden = false
+            thumbnailImageView.isHidden = true
         }
     }
     
@@ -611,23 +732,26 @@ class ClipboardItemView: NSView {
         isSelected = selected
         
         if selected {
-            layer?.backgroundColor = NSColor.systemBlue.withAlphaComponent(0.4).cgColor
-            layer?.borderColor = NSColor.systemBlue.cgColor
-            layer?.borderWidth = 2
-            indexBadge.layer?.backgroundColor = NSColor.white.cgColor
-            indexLabel.textColor = NSColor.systemBlue
+            backgroundView.material = .selection
+            backgroundView.layer?.borderColor = NSColor.systemBlue.withAlphaComponent(0.9).cgColor
+            backgroundView.layer?.borderWidth = 1.5
+            // indexBadge.layer?.backgroundColor = NSColor.white.cgColor
+            // indexLabel.textColor = NSColor.systemBlue
             titleLabel.textColor = .white
             previewLabel.textColor = NSColor(white: 0.9, alpha: 1.0)
         } else {
-            layer?.backgroundColor = NSColor(white: 0.15, alpha: 0.9).cgColor
-            layer?.borderColor = NSColor(white: 0.3, alpha: 0.5).cgColor
-            layer?.borderWidth = 1.5
-            indexBadge.layer?.backgroundColor = NSColor.systemBlue.withAlphaComponent(0.8).cgColor
-            indexLabel.textColor = .white
+            backgroundView.material = .underWindowBackground
+            backgroundView.layer?.borderColor = NSColor.white.withAlphaComponent(0.18).cgColor
+            backgroundView.layer?.borderWidth = 1.0
+            // indexBadge.layer?.backgroundColor = NSColor.systemBlue.withAlphaComponent(0.8).cgColor
+            // indexLabel.textColor = .white
             titleLabel.textColor = .white
             previewLabel.textColor = NSColor(white: 0.7, alpha: 1.0)
         }
     }
+
+    // 让卡片内部任意区域的点击都落到卡片本身，确保单击/双击逻辑稳定
+    override func hitTest(_ point: NSPoint) -> NSView? { self }
     
     override func mouseDown(with event: NSEvent) {
         clickCount += 1

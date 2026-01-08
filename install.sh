@@ -103,7 +103,7 @@ case $choice in
         echo -e "${GREEN}✓ 应用已启动${NC}"
         echo ""
         echo -e "${YELLOW}注意: 应用未安装到系统，仅作为测试运行${NC}"
-        echo -e "${BLUE}提示: 应用会出现在状态栏，按 ⌘⇧V 测试功能${NC}"
+        echo -e "${BLUE}提示: 应用会出现在状态栏，按 ⌘⌥V 测试功能${NC}"
         ;;
     4)
         echo ""
@@ -127,7 +127,7 @@ case $choice in
         echo ""
         echo -e "${YELLOW}步骤 4: 开始使用${NC}"
         echo "  • 应用会在状态栏显示图标"
-        echo "  • 按 ⌘⇧V 打开剪贴板历史"
+        echo "  • 按 ⌘⌥V 打开剪贴板历史"
         echo "  • 复制任何内容会自动记录"
         echo ""
         echo -e "${BLUE}详细说明请查看「使用说明.md」或「快速开始.md」${NC}"

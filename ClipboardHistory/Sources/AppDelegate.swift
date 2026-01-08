@@ -7,6 +7,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var clipboardManager: ClipboardManager?
     var historyWindow: HistoryWindowController?
     var shortcutManager: KeyboardShortcutManager?
+    var settingsWindow: SettingsWindowController?
     
     private let singleClickPasteKey = "singleClickPasteEnabled"
     private let preserveClipboardAfterPasteKey = "preserveClipboardAfterPasteEnabled"
@@ -29,7 +30,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             singleClickPasteKey: true,
             preserveClipboardAfterPasteKey: true,
             // 方向键默认只用于“切换选中”，不自动粘贴；如需可在菜单中手动开启
-            keyboardNavigatePasteKey: false
+            keyboardNavigatePasteKey: false,
+            // 外观默认值
+            AppearanceSettings.historyBackgroundAlphaKey: 0.9,
+            AppearanceSettings.cardBackgroundAlphaKey: 0.85
         ])
 
         // 监听前台应用切换，记录“最后一个非本应用”的前台应用
@@ -98,6 +102,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "清空历史", action: #selector(clearHistory), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "设置…", action: #selector(showSettings), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "关于", action: #selector(showAbout), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "退出", action: #selector(quit), keyEquivalent: "q"))
@@ -160,6 +165,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         alert.alertStyle = .informational
         alert.addButton(withTitle: "确定")
         alert.runModal()
+    }
+
+    @objc func showSettings() {
+        if settingsWindow == nil {
+            settingsWindow = SettingsWindowController()
+        }
+        settingsWindow?.show()
     }
     
     @objc func quit() {

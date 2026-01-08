@@ -137,7 +137,7 @@ remad.md                                原始需求说明
 ────────────────────────────────────────────────────────────
 
 操作系统:  macOS 11.0 (Big Sur) 或更高
-架构:      Intel x86_64 / Apple Silicon (Rosetta 2)
+架构:      仅支持 Apple Silicon (arm64)，不支持 Intel x86_64 / Rosetta 2
 权限:      辅助功能权限（必需）
 存储:      < 5 MB
 内存:      < 50 MB

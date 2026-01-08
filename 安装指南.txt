@@ -104,7 +104,7 @@ A: 屏幕底部显示，宽度100%，高度20%，横向滚动卡片
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
   • macOS 11.0 (Big Sur) 或更高版本
-  • Intel x86_64 或 Apple Silicon (Rosetta 2)
+  • 仅支持 Apple Silicon (arm64)，不支持 Intel x86_64 / Rosetta 2
   • 辅助功能权限
 
 

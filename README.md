@@ -28,7 +28,7 @@
 ## 系统要求
 
 - **操作系统**: macOS 11.0 (Big Sur) 或更高版本
-- **架构**: Intel x86_64 或 Apple Silicon (通过 Rosetta 2)
+- **架构**: 仅支持 Apple Silicon (arm64)，不支持 Intel x86_64 / Rosetta 2
 - **权限**: 需要辅助功能权限
 
 ## 安装说明

@@ -37,15 +37,15 @@ class ClipboardItem: NSObject, Codable {
         case .text:
             return textContent?.prefix(100).description ?? ""
         case .image:
-            return "📷 图片"
+            return "图片"
         case .file:
             let count = fileURLs?.count ?? 0
             if count == 1, let fileName = fileURLs?.first?.split(separator: "/").last {
-                return "📄 \(fileName)"
+                return "\(fileName)"
             }
-            return "📄 \(count) 个文件"
+            return "\(count) 个文件"
         case .url:
-            return "🔗 \(urlString ?? "")"
+            return urlString ?? ""
         case .unknown:
             return "未知类型"
         }
@@ -73,9 +73,7 @@ class ClipboardItem: NSObject, Codable {
         case .text:
             return NSImage(systemSymbolName: "doc.text", accessibilityDescription: nil)
         case .image:
-            if let data = imageData, let image = NSImage(data: data) {
-                return image
-            }
+            // 图片类型左上角显示通用图标，实际图片显示在预览区
             return NSImage(systemSymbolName: "photo", accessibilityDescription: nil)
         case .file:
             if let firstFile = fileURLs?.first {
