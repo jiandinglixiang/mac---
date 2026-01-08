@@ -1,0 +1,13 @@
+# macOS
+.DS_Store
+
+# Build artifacts
+build/*
+*.app
+*.dmg
+!build/剪贴板历史-1.0.0.dmg
+
+# Editors
+.vscode/
+.idea/
+.cursor/

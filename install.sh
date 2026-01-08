@@ -61,7 +61,7 @@ case $choice in
         echo "  4. 右键点击「剪贴板历史」，选择「打开」"
         echo "  5. 授予辅助功能权限"
         echo ""
-        echo -e "${BLUE}提示: 查看「使用说明.md」了解如何授予权限${NC}"
+        echo -e "${BLUE}提示: 查看「README.md」了解如何授予权限${NC}"
         ;;
     2)
         echo ""
@@ -130,7 +130,7 @@ case $choice in
         echo "  • 按 ⌘⌥V 打开剪贴板历史"
         echo "  • 复制任何内容会自动记录"
         echo ""
-        echo -e "${BLUE}详细说明请查看「使用说明.md」或「快速开始.md」${NC}"
+        echo -e "${BLUE}详细说明请查看「README.md」${NC}"
         echo ""
         ;;
     5)
@@ -149,8 +149,6 @@ echo -e "${GREEN}感谢使用剪贴板历史工具！${NC}"
 echo -e "${GREEN}════════════════════════════════════════════${NC}"
 echo ""
 echo "📚 查看文档："
-echo "  • 快速开始: cat 快速开始.md"
-echo "  • 使用说明: cat 使用说明.md"
 echo "  • 项目说明: cat README.md"
 echo ""
 echo "🔧 重新构建："
