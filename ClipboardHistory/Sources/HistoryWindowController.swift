@@ -38,9 +38,6 @@ class HistoryWindowController: NSWindowController, NSWindowDelegate {
     private var itemViews: [ClipboardItemView] = []
     private var selectedIndex: Int = 0
     private var previousActiveApp: NSRunningApplication?  // 记住之前的活动应用
-    private let singleClickPasteKey = "singleClickPasteEnabled"
-    private let preserveClipboardAfterPasteKey = "preserveClipboardAfterPasteEnabled"
-    private let keyboardNavigatePasteKey = "keyboardNavigatePasteEnabled"
     private var appearanceObserver: NSObjectProtocol?
     
     override var window: NSWindow? {
@@ -168,6 +165,21 @@ class HistoryWindowController: NSWindowController, NSWindowDelegate {
         itemViews.forEach { $0.applyCardAppearanceSettings() }
     }
     
+    /// 根据窗口坐标定位被点击的卡片（不依赖 AppKit hitTest），用于解决“点A贴B”的错位问题。
+    /// - Parameter pointInWindow: `event.locationInWindow`
+    func itemAtWindowPoint(_ pointInWindow: NSPoint) -> ClipboardItem? {
+        // 把窗口坐标转换到 containerView 坐标系（会自动包含 scrollView 的偏移）
+        let pointInContainer = containerView.convert(pointInWindow, from: nil)
+        
+        // 从后往前找（更贴近 Z-order：后添加的视图在更上层）
+        for view in itemViews.reversed() {
+            if view.frame.contains(pointInContainer), let item = view.boundItem {
+                return item
+            }
+        }
+        return nil
+    }
+    
     private func updateWindowPosition() {
         let mouseLocation = NSEvent.mouseLocation
         // 找到包含鼠标的屏幕，如果找不到则默认使用主屏幕
@@ -247,12 +259,15 @@ class HistoryWindowController: NSWindowController, NSWindowDelegate {
                 frame: NSRect(x: x, y: y, width: itemWidth, height: itemHeight)
             )
             itemView.configure(with: item, index: index)
-            itemView.onClick = { [weak self] in
-                self?.handleItemClick(at: index)
+            // 关键修复：点击绑定到“item本体/ID”，而不是 index。
+            // 否则一旦 items 在窗口显示期间发生插入/重排（例如剪贴板监控更新 history），就会出现“点A卡片却按 index 取到B内容”的错位。
+            itemView.onClick = { [weak self] clickedItem in
+                self?.handleItemClick(clickedItem)
             }
-            itemView.onDoubleClick = { [weak self] in
-                self?.selectAndPaste(item)
-            }
+            // 移除双击处理，统一为单击即粘贴
+            // itemView.onDoubleClick = { [weak self] in
+            //     self?.selectAndPaste(item)
+            // }
             
             containerView.addSubview(itemView)
             itemViews.append(itemView)
@@ -265,14 +280,9 @@ class HistoryWindowController: NSWindowController, NSWindowDelegate {
         applyAppearanceSettings()
     }
     
-    private func handleItemClick(at index: Int) {
-        selectItem(at: index)
-        
-        // 可选：单击即粘贴（写入剪贴板 + 切回原应用 + ⌘V）
-        if UserDefaults.standard.bool(forKey: singleClickPasteKey),
-           index >= 0, index < items.count {
-            selectAndPaste(items[index])
-        }
+    fileprivate func handleItemClick(_ item: ClipboardItem) {
+        // 按你的需求：鼠标点击不依赖/不切换“选中状态”，只粘贴被点中的卡片内容
+        selectAndPaste(item)
     }
     
     private func selectItem(at index: Int) {
@@ -306,41 +316,32 @@ class HistoryWindowController: NSWindowController, NSWindowDelegate {
     }
     
     private func selectAndPaste(_ item: ClipboardItem) {
-        let preserveClipboard = UserDefaults.standard.bool(forKey: preserveClipboardAfterPasteKey)
-        let snapshot = preserveClipboard ? (NSApp.delegate as? AppDelegate)?.clipboardManager?.snapshotPasteboard() : nil
-
         // 复制到剪贴板
         if let appDelegate = NSApp.delegate as? AppDelegate {
             appDelegate.clipboardManager?.copyToClipboard(item)
         }
-        
+
         // 保存之前的应用引用
         let targetApp = previousActiveApp
-        
+
         // 关闭窗口
         hideWindow()
-        
+
         // 先激活之前的应用，再执行粘贴
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+        // 优化：缩短等待时间以提高响应速度
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.01) {
             // 激活之前的应用
             if let app = targetApp {
                 app.activate(options: [.activateIgnoringOtherApps])
             }
             
             // 等待应用激活后再粘贴
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-                let pasted = self.simulatePaste()
-
-                // 若粘贴成功且启用了“恢复剪贴板”，则在粘贴后恢复原剪贴板内容，避免污染用户剪贴板
-                if pasted, let snapshot {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
-                        (NSApp.delegate as? AppDelegate)?.clipboardManager?.restorePasteboard(from: snapshot)
-                    }
-                }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
+                _ = self.simulatePaste()
             }
         }
     }
-    
+
     @discardableResult
     private func simulatePaste() -> Bool {
         // 模拟键盘事件需要“辅助功能”权限（系统设置 -> 隐私与安全性 -> 辅助功能）
@@ -414,18 +415,10 @@ class HistoryWindowController: NSWindowController, NSWindowDelegate {
         case 124, 125: // 右箭头(124) 或 下箭头(125) - 选择下一个
             if selectedIndex < itemViews.count - 1 {
                 selectItem(at: selectedIndex + 1)
-                if UserDefaults.standard.bool(forKey: keyboardNavigatePasteKey),
-                   selectedIndex >= 0, selectedIndex < items.count {
-                    selectAndPaste(items[selectedIndex])
-                }
             }
         case 123, 126: // 左箭头(123) 或 上箭头(126) - 选择上一个
             if selectedIndex > 0 {
                 selectItem(at: selectedIndex - 1)
-                if UserDefaults.standard.bool(forKey: keyboardNavigatePasteKey),
-                   selectedIndex >= 0, selectedIndex < items.count {
-                    selectAndPaste(items[selectedIndex])
-                }
             }
         case 51: // Delete/Backspace
             if selectedIndex >= 0 && selectedIndex < items.count {
@@ -546,14 +539,16 @@ class ClickThroughView: NSView {
     
     override func mouseDown(with event: NSEvent) {
         let location = event.locationInWindow
-        let hitView = self.hitTest(location)
         
-        // 如果点击点不在任何卡片（包含卡片子视图）上，则隐藏窗口
-        if let hitView, hitView.enclosingView(ofType: ClipboardItemView.self) == nil {
-            windowController?.hideWindow()
-        } else {
-            super.mouseDown(with: event)
+        // 关键修复：不用 hitTest 来判断点中了哪张卡片，直接在容器坐标里用 frame.contains 精确定位。
+        // 这样可规避某些情况下 hitTest/子视图拦截导致命中错乱，从而出现“点A贴B”。
+        if let item = windowController?.itemAtWindowPoint(location) {
+            windowController?.handleItemClick(item)
+            return
         }
+        
+        // 未点击到任何卡片：隐藏窗口
+        windowController?.hideWindow()
     }
     
     override func keyDown(with event: NSEvent) {
@@ -574,10 +569,14 @@ class ClipboardItemView: NSView {
     // private let indexBadge = NSView()
     // private let indexLabel = NSTextField(labelWithString: "")
     private var isSelected = false
-    var onClick: (() -> Void)?
-    var onDoubleClick: (() -> Void)?
-    private var clickCount = 0
-    private var clickTimer: Timer?
+    /// 点击回调：直接回传当前卡片绑定的 ClipboardItem，避免任何 index/选中状态错位
+    var onClick: ((ClipboardItem) -> Void)?
+    // var onDoubleClick: (() -> Void)? // 移除双击
+    
+    /// 当前卡片绑定的剪贴板项 ID，用于在外部根据 ID 精确定位/高亮。
+    private(set) var itemID: UUID?
+    /// 当前卡片绑定的剪贴板项（用于外部根据坐标定位后直接取到正确内容）
+    private(set) var boundItem: ClipboardItem?
     
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -691,6 +690,8 @@ class ClipboardItemView: NSView {
     }
     
     func configure(with item: ClipboardItem, index: Int) {
+        self.itemID = item.id
+        self.boundItem = item
         iconImageView.image = item.icon
         titleLabel.stringValue = item.displayText
         // 保留换行符以便多行显示
@@ -750,26 +751,6 @@ class ClipboardItemView: NSView {
         }
     }
 
-    // 让卡片内部任意区域的点击都落到卡片本身，确保单击/双击逻辑稳定
-    override func hitTest(_ point: NSPoint) -> NSView? { self }
-    
-    override func mouseDown(with event: NSEvent) {
-        clickCount += 1
-        
-        if clickCount == 1 {
-            // 单击 - 延迟执行，等待可能的双击
-            clickTimer?.invalidate()
-            clickTimer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: false) { [weak self] _ in
-                if self?.clickCount == 1 {
-                    self?.onClick?()
-                }
-                self?.clickCount = 0
-            }
-        } else if clickCount == 2 {
-            // 双击
-            clickTimer?.invalidate()
-            clickCount = 0
-            onDoubleClick?()
-        }
-    }
+    // 说明：点击事件已在 ClickThroughView 中统一处理（坐标命中卡片 → 取 boundItem → 粘贴），
+    // 这里不再依赖 hitTest/mouseDown 以避免命中错位导致“点A贴B”。
 }

@@ -9,13 +9,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var shortcutManager: KeyboardShortcutManager?
     var settingsWindow: SettingsWindowController?
     
-    private let singleClickPasteKey = "singleClickPasteEnabled"
-    private let preserveClipboardAfterPasteKey = "preserveClipboardAfterPasteEnabled"
-    private let keyboardNavigatePasteKey = "keyboardNavigatePasteEnabled"
-    private weak var singleClickPasteMenuItem: NSMenuItem?
-    private weak var preserveClipboardMenuItem: NSMenuItem?
-    private weak var keyboardNavigatePasteMenuItem: NSMenuItem?
-
     /// 最近一次“非本应用”的前台应用，用于把粘贴投递回用户原来的输入焦点处。
     ///（快捷键触发时，本应用可能已成为 active，直接读 frontmostApplication 会拿错）
     private(set) var lastNonSelfActiveApp: NSRunningApplication?
@@ -27,10 +20,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         
         // 默认配置
         UserDefaults.standard.register(defaults: [
-            singleClickPasteKey: true,
-            preserveClipboardAfterPasteKey: true,
-            // 方向键默认只用于“切换选中”，不自动粘贴；如需可在菜单中手动开启
-            keyboardNavigatePasteKey: false,
             // 外观默认值
             AppearanceSettings.historyBackgroundAlphaKey: 0.9,
             AppearanceSettings.cardBackgroundAlphaKey: 0.85
@@ -82,24 +71,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         
         menu.addItem(NSMenuItem(title: "显示历史 (⌘⌥V)", action: #selector(showHistory), keyEquivalent: ""))
         
-        let singleClickItem = NSMenuItem(title: "单击即粘贴", action: #selector(toggleSingleClickPaste), keyEquivalent: "")
-        singleClickItem.target = self
-        singleClickItem.state = UserDefaults.standard.bool(forKey: singleClickPasteKey) ? .on : .off
-        menu.addItem(singleClickItem)
-        self.singleClickPasteMenuItem = singleClickItem
-
-        let preserveClipboardItem = NSMenuItem(title: "粘贴后恢复原剪贴板", action: #selector(togglePreserveClipboardAfterPaste), keyEquivalent: "")
-        preserveClipboardItem.target = self
-        preserveClipboardItem.state = UserDefaults.standard.bool(forKey: preserveClipboardAfterPasteKey) ? .on : .off
-        menu.addItem(preserveClipboardItem)
-        self.preserveClipboardMenuItem = preserveClipboardItem
-
-        let keyboardNavigatePasteItem = NSMenuItem(title: "方向键切换时自动粘贴", action: #selector(toggleKeyboardNavigatePaste), keyEquivalent: "")
-        keyboardNavigatePasteItem.target = self
-        keyboardNavigatePasteItem.state = UserDefaults.standard.bool(forKey: keyboardNavigatePasteKey) ? .on : .off
-        menu.addItem(keyboardNavigatePasteItem)
-        self.keyboardNavigatePasteMenuItem = keyboardNavigatePasteItem
-        
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "清空历史", action: #selector(clearHistory), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "设置…", action: #selector(showSettings), keyEquivalent: ""))
@@ -112,27 +83,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     
     @objc func showHistory() {
         toggleHistoryWindow()
-    }
-    
-    @objc func toggleSingleClickPaste() {
-        let current = UserDefaults.standard.bool(forKey: singleClickPasteKey)
-        let next = !current
-        UserDefaults.standard.set(next, forKey: singleClickPasteKey)
-        singleClickPasteMenuItem?.state = next ? .on : .off
-    }
-
-    @objc func togglePreserveClipboardAfterPaste() {
-        let current = UserDefaults.standard.bool(forKey: preserveClipboardAfterPasteKey)
-        let next = !current
-        UserDefaults.standard.set(next, forKey: preserveClipboardAfterPasteKey)
-        preserveClipboardMenuItem?.state = next ? .on : .off
-    }
-
-    @objc func toggleKeyboardNavigatePaste() {
-        let current = UserDefaults.standard.bool(forKey: keyboardNavigatePasteKey)
-        let next = !current
-        UserDefaults.standard.set(next, forKey: keyboardNavigatePasteKey)
-        keyboardNavigatePasteMenuItem?.state = next ? .on : .off
     }
     
     @objc func clearHistory() {
@@ -182,6 +132,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if let window = historyWindow?.window, window.isVisible {
             window.orderOut(nil)
         } else {
+            // 只有在“自动模拟粘贴(⌘V)”路径下才需要辅助功能权限；
+            // 现已移除“仅写入系统剪贴板”选项，默认总是模拟粘贴，因此总是检查权限。
             _ = ensureAccessibilityPermission(prompt: false)
             historyWindow?.showWindow(clipboardManager?.history ?? [], previousActiveApp: lastNonSelfActiveApp)
         }
