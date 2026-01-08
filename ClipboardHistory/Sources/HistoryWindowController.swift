@@ -1,4 +1,16 @@
 import Cocoa
+import ApplicationServices
+
+// MARK: - 自定义窗口类（允许无边框窗口接收键盘事件）
+class KeyableWindow: NSWindow {
+    override var canBecomeKey: Bool {
+        return true
+    }
+    
+    override var canBecomeMain: Bool {
+        return true
+    }
+}
 
 class HistoryWindowController: NSWindowController, NSWindowDelegate {
     private var window_: NSWindow?
@@ -7,6 +19,10 @@ class HistoryWindowController: NSWindowController, NSWindowDelegate {
     private var items: [ClipboardItem] = []
     private var itemViews: [ClipboardItemView] = []
     private var selectedIndex: Int = 0
+    private var previousActiveApp: NSRunningApplication?  // 记住之前的活动应用
+    private let singleClickPasteKey = "singleClickPasteEnabled"
+    private let preserveClipboardAfterPasteKey = "preserveClipboardAfterPasteEnabled"
+    private let keyboardNavigatePasteKey = "keyboardNavigatePasteEnabled"
     
     override var window: NSWindow? {
         get { return window_ }
@@ -36,10 +52,10 @@ class HistoryWindowController: NSWindowController, NSWindowDelegate {
             height: windowHeight
         )
         
-        // 创建窗口
-        let window = NSWindow(
+        // 创建窗口（使用自定义窗口类以支持键盘事件）
+        let window = KeyableWindow(
             contentRect: windowFrame,
-            styleMask: [.borderless, .nonactivatingPanel],
+            styleMask: [.borderless],
             backing: .buffered,
             defer: false
         )
@@ -59,24 +75,36 @@ class HistoryWindowController: NSWindowController, NSWindowDelegate {
         contentView.windowController = self
         window.contentView = contentView
         
-        // 创建横向滚动视图（占据整个窗口）
-        scrollView = NSScrollView(frame: NSRect(
+        // 创建自定义横向滚动视图（占据整个窗口）
+        scrollView = HorizontalScrollView(frame: NSRect(
             x: 0,
             y: 0,
             width: screenFrame.width,
             height: windowHeight
         ))
-        scrollView.hasHorizontalScroller = true
+        
+        // 替换默认的 clipView 为自定义的
+        let customClipView = HorizontalClipView(frame: scrollView.contentView.frame)
+        customClipView.drawsBackground = false
+        scrollView.contentView = customClipView
+        
+        scrollView.hasHorizontalScroller = false
         scrollView.hasVerticalScroller = false
-        scrollView.autohidesScrollers = false
         scrollView.backgroundColor = .clear
         scrollView.drawsBackground = false
         scrollView.borderType = .noBorder
         scrollView.horizontalScrollElasticity = .allowed
-        scrollView.verticalScrollElasticity = .none // 禁止垂直滚动
+        scrollView.verticalScrollElasticity = .none
+        scrollView.automaticallyAdjustsContentInsets = false
+        scrollView.contentInsets = NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
+        scrollView.scrollerInsets = NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
+        scrollView.usesPredominantAxisScrolling = true  // 只使用主轴滚动
         
-        // 创建容器视图（用于横向排列项目）
-        containerView = NSView(frame: NSRect(x: 0, y: 0, width: 0, height: windowHeight))
+        // 内容高度（完全填充窗口高度）
+        let contentHeight = windowHeight
+        
+        // 创建容器视图（高度精确匹配窗口高度）
+        containerView = FlippedView(frame: NSRect(x: 0, y: 0, width: 0, height: contentHeight))
         containerView.wantsLayer = true
         containerView.layer?.backgroundColor = NSColor.clear.cgColor
         
@@ -86,9 +114,12 @@ class HistoryWindowController: NSWindowController, NSWindowDelegate {
         self.window_ = window
     }
     
-    func showWindow(_ items: [ClipboardItem]) {
+    func showWindow(_ items: [ClipboardItem], previousActiveApp: NSRunningApplication?) {
         self.items = items
         self.selectedIndex = 0
+
+        // 优先使用 AppDelegate 传入的“最后一个非本应用前台App”，更可靠
+        self.previousActiveApp = previousActiveApp
         
         updateItemViews()
         
@@ -97,8 +128,10 @@ class HistoryWindowController: NSWindowController, NSWindowDelegate {
         window?.orderFrontRegardless()
         NSApp.activate(ignoringOtherApps: true)
         
-        // 确保窗口获得键盘焦点
-        window?.makeFirstResponder(window_)
+        // 确保内容视图获得键盘焦点（这样才能接收键盘事件）
+        if let contentView = window?.contentView {
+            window?.makeFirstResponder(contentView)
+        }
         
         // 选中第一个项目
         if !itemViews.isEmpty {
@@ -116,17 +149,23 @@ class HistoryWindowController: NSWindowController, NSWindowDelegate {
             return
         }
         
-        // 项目尺寸
-        let itemWidth: CGFloat = 250
-        let itemHeight = scrollView.frame.height - 40 // 留出上下边距
-        let itemSpacing: CGFloat = 15
-        let leftPadding: CGFloat = 20
-        let topPadding: CGFloat = 20
+        // 可用内容高度（与滚动视图高度一致）
+        let availableHeight = scrollView.frame.height
+        
+        // 项目尺寸 - 上下边距
+        let verticalPadding: CGFloat = 16
+        let itemWidth: CGFloat = 180
+        let itemHeight = availableHeight - (verticalPadding * 2) // 卡片高度
+        let itemSpacing: CGFloat = 10
+        let leftPadding: CGFloat = 16
+        
+        // 容器视图高度与滚动视图高度一致（防止垂直滚动）
+        containerView.frame.size.height = availableHeight
         
         // 创建横向排列的项目视图
         for (index, item) in items.enumerated() {
             let x = leftPadding + CGFloat(index) * (itemWidth + itemSpacing)
-            let y = topPadding
+            let y = verticalPadding
             
             let itemView = ClipboardItemView(
                 frame: NSRect(x: x, y: y, width: itemWidth, height: itemHeight)
@@ -143,13 +182,19 @@ class HistoryWindowController: NSWindowController, NSWindowDelegate {
             itemViews.append(itemView)
         }
         
-        // 更新容器视图大小
+        // 更新容器视图宽度
         let totalWidth = leftPadding + CGFloat(items.count) * (itemWidth + itemSpacing) + leftPadding
         containerView.frame.size.width = max(totalWidth, scrollView.frame.width)
     }
     
     private func handleItemClick(at index: Int) {
         selectItem(at: index)
+        
+        // 可选：单击即粘贴（写入剪贴板 + 切回原应用 + ⌘V）
+        if UserDefaults.standard.bool(forKey: singleClickPasteKey),
+           index >= 0, index < items.count {
+            selectAndPaste(items[index])
+        }
     }
     
     private func selectItem(at index: Int) {
@@ -183,70 +228,137 @@ class HistoryWindowController: NSWindowController, NSWindowDelegate {
     }
     
     private func selectAndPaste(_ item: ClipboardItem) {
+        let preserveClipboard = UserDefaults.standard.bool(forKey: preserveClipboardAfterPasteKey)
+        let snapshot = preserveClipboard ? (NSApp.delegate as? AppDelegate)?.clipboardManager?.snapshotPasteboard() : nil
+
         // 复制到剪贴板
         if let appDelegate = NSApp.delegate as? AppDelegate {
             appDelegate.clipboardManager?.copyToClipboard(item)
         }
         
+        // 保存之前的应用引用
+        let targetApp = previousActiveApp
+        
         // 关闭窗口
         hideWindow()
         
-        // 模拟粘贴 (Cmd+V)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-            self.simulatePaste()
+        // 先激活之前的应用，再执行粘贴
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+            // 激活之前的应用
+            if let app = targetApp {
+                app.activate(options: [.activateIgnoringOtherApps])
+            }
+            
+            // 等待应用激活后再粘贴
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                let pasted = self.simulatePaste()
+
+                // 若粘贴成功且启用了“恢复剪贴板”，则在粘贴后恢复原剪贴板内容，避免污染用户剪贴板
+                if pasted, let snapshot {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                        (NSApp.delegate as? AppDelegate)?.clipboardManager?.restorePasteboard(from: snapshot)
+                    }
+                }
+            }
         }
     }
     
-    private func simulatePaste() {
+    @discardableResult
+    private func simulatePaste() -> Bool {
+        // 模拟键盘事件需要“辅助功能”权限（系统设置 -> 隐私与安全性 -> 辅助功能）
+        // 注意：开发/重编译后若 App 路径或签名变化，系统可能把它当成“另一个 App”，需要重新在辅助功能里勾选一次。
+        if !AXIsProcessTrusted() {
+            let promptKey = kAXTrustedCheckOptionPrompt.takeUnretainedValue()
+            let options: [CFString: Any] = [promptKey: true]
+            _ = AXIsProcessTrustedWithOptions(options as CFDictionary)
+
+            let appPath = Bundle.main.bundleURL.path
+            let alert = NSAlert()
+            alert.messageText = "辅助功能权限未生效"
+            alert.informativeText = """
+为了把选中的内容直接粘贴到当前输入框，需要在「系统设置 → 隐私与安全性 → 辅助功能」中允许本应用。
+
+当前运行的应用路径：
+\(appPath)
+
+如果你已经勾选过但仍提示，请在辅助功能列表里删除旧条目后重新添加上述路径的这个 App，并完全退出后重新打开。
+"""
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "打开系统设置")
+            alert.addButton(withTitle: "知道了")
+            let result = alert.runModal()
+            if result == .alertFirstButtonReturn,
+               let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+                NSWorkspace.shared.open(url)
+            }
+            return false
+        }
+        
         // 使用 CGEvent 模拟 Cmd+V
-        let source = CGEventSource(stateID: .hidSystemState)
+        let source = CGEventSource(stateID: .combinedSessionState)
         
-        // 按下 Command 键
-        let cmdDown = CGEvent(keyboardEventSource: source, virtualKey: 0x37, keyDown: true)
-        cmdDown?.flags = .maskCommand
+        // V 键的虚拟键码
+        let vKeyCode: CGKeyCode = 0x09
         
-        // 按下 V 键
-        let vDown = CGEvent(keyboardEventSource: source, virtualKey: 0x09, keyDown: true)
-        vDown?.flags = .maskCommand
+        // 创建按下 V 键事件（带 Command 修饰键）
+        guard let keyDown = CGEvent(keyboardEventSource: source, virtualKey: vKeyCode, keyDown: true) else {
+            print("无法创建按键事件")
+            return false
+        }
+        keyDown.flags = .maskCommand
         
-        // 释放 V 键
-        let vUp = CGEvent(keyboardEventSource: source, virtualKey: 0x09, keyDown: false)
-        vUp?.flags = .maskCommand
+        // 创建释放 V 键事件
+        guard let keyUp = CGEvent(keyboardEventSource: source, virtualKey: vKeyCode, keyDown: false) else {
+            print("无法创建释放按键事件")
+            return false
+        }
+        keyUp.flags = .maskCommand
         
-        // 释放 Command 键
-        let cmdUp = CGEvent(keyboardEventSource: source, virtualKey: 0x37, keyDown: false)
-        
-        // 发送事件
-        let location = CGEventTapLocation.cghidEventTap
-        cmdDown?.post(tap: location)
-        vDown?.post(tap: location)
-        vUp?.post(tap: location)
-        cmdUp?.post(tap: location)
+        // 发送事件到系统
+        keyDown.post(tap: .cghidEventTap)
+        keyUp.post(tap: .cghidEventTap)
+
+        return true
     }
     
     func hideWindow() {
         window?.orderOut(nil)
     }
     
-    override func keyDown(with event: NSEvent) {
-        if event.keyCode == 53 { // ESC
+    func handleKeyDown(with event: NSEvent) {
+        switch event.keyCode {
+        case 53: // ESC
             hideWindow()
-        } else if event.keyCode == 36 { // Enter
+        case 36, 76: // Enter (主键盘36, 小键盘76)
             if selectedIndex >= 0 && selectedIndex < items.count {
                 selectAndPaste(items[selectedIndex])
             }
-        } else if event.keyCode == 124 { // 右箭头
+        case 124, 125: // 右箭头(124) 或 下箭头(125) - 选择下一个
             if selectedIndex < itemViews.count - 1 {
                 selectItem(at: selectedIndex + 1)
+                if UserDefaults.standard.bool(forKey: keyboardNavigatePasteKey),
+                   selectedIndex >= 0, selectedIndex < items.count {
+                    selectAndPaste(items[selectedIndex])
+                }
             }
-        } else if event.keyCode == 123 { // 左箭头
+        case 123, 126: // 左箭头(123) 或 上箭头(126) - 选择上一个
             if selectedIndex > 0 {
                 selectItem(at: selectedIndex - 1)
+                if UserDefaults.standard.bool(forKey: keyboardNavigatePasteKey),
+                   selectedIndex >= 0, selectedIndex < items.count {
+                    selectAndPaste(items[selectedIndex])
+                }
             }
-        } else if event.keyCode == 51 { // Delete/Backspace
+        case 51: // Delete/Backspace
             if selectedIndex >= 0 && selectedIndex < items.count {
                 deleteItem(at: selectedIndex)
             }
+        case 49: // 空格键 - 也可以确认粘贴
+            if selectedIndex >= 0 && selectedIndex < items.count {
+                selectAndPaste(items[selectedIndex])
+            }
+        default:
+            break
         }
     }
     
@@ -279,9 +391,80 @@ class HistoryWindowController: NSWindowController, NSWindowDelegate {
     }
 }
 
+// MARK: - 翻转视图（使坐标系从上往下）
+class FlippedView: NSView {
+    override var isFlipped: Bool { return true }
+}
+
+// MARK: - 自定义横向滚动视图（将纵向滚动转为横向）
+class HorizontalScrollView: NSScrollView {
+    override func scrollWheel(with event: NSEvent) {
+        // 将垂直滚动转换为水平滚动
+        if abs(event.deltaY) > abs(event.deltaX) {
+            // 获取原始的滚动值
+            let deltaY = event.deltaY
+            let scrollingDeltaY = event.scrollingDeltaY
+            
+            // 直接操作滚动位置
+            var newOrigin = self.contentView.bounds.origin
+            
+            // 使用 scrollingDeltaY 进行更平滑的滚动
+            if event.hasPreciseScrollingDeltas {
+                newOrigin.x -= scrollingDeltaY
+            } else {
+                newOrigin.x -= deltaY * 10 // 乘以系数增加滚动速度
+            }
+            
+            // 限制滚动范围
+            let maxX = max(0, (self.documentView?.frame.width ?? 0) - self.contentView.bounds.width)
+            newOrigin.x = max(0, min(newOrigin.x, maxX))
+            newOrigin.y = 0 // 锁定 Y 轴
+            
+            self.contentView.scroll(to: newOrigin)
+            self.reflectScrolledClipView(self.contentView)
+            return
+        }
+        
+        // 如果是水平滚动，使用默认行为但锁定 Y
+        var newOrigin = self.contentView.bounds.origin
+        newOrigin.x -= event.scrollingDeltaX
+        
+        let maxX = max(0, (self.documentView?.frame.width ?? 0) - self.contentView.bounds.width)
+        newOrigin.x = max(0, min(newOrigin.x, maxX))
+        newOrigin.y = 0
+        
+        self.contentView.scroll(to: newOrigin)
+        self.reflectScrolledClipView(self.contentView)
+    }
+}
+
+// MARK: - 自定义 ClipView（锁定垂直滚动）
+class HorizontalClipView: NSClipView {
+    override func constrainBoundsRect(_ proposedBounds: NSRect) -> NSRect {
+        var constrained = super.constrainBoundsRect(proposedBounds)
+        constrained.origin.y = 0 // 锁定 Y 轴位置
+        return constrained
+    }
+    
+    override func scroll(to newOrigin: NSPoint) {
+        var lockedOrigin = newOrigin
+        lockedOrigin.y = 0 // 锁定 Y 轴
+        super.scroll(to: lockedOrigin)
+    }
+}
+
 // MARK: - 自定义点击穿透视图
 class ClickThroughView: NSView {
     weak var windowController: HistoryWindowController?
+    
+    // 允许视图成为 first responder，以便接收键盘事件
+    override var acceptsFirstResponder: Bool {
+        return true
+    }
+    
+    override func becomeFirstResponder() -> Bool {
+        return true
+    }
     
     override func mouseDown(with event: NSEvent) {
         let location = event.locationInWindow
@@ -294,6 +477,11 @@ class ClickThroughView: NSView {
             super.mouseDown(with: event)
         }
     }
+    
+    override func keyDown(with event: NSEvent) {
+        // 将键盘事件传递给 windowController 处理
+        windowController?.handleKeyDown(with: event)
+    }
 }
 
 // MARK: - 自定义横向项目视图
@@ -302,6 +490,7 @@ class ClipboardItemView: NSView {
     private let titleLabel = NSTextField(labelWithString: "")
     private let previewLabel = NSTextField(labelWithString: "")
     private let timeLabel = NSTextField(labelWithString: "")
+    private let indexBadge = NSView()
     private let indexLabel = NSTextField(labelWithString: "")
     private var isSelected = false
     var onClick: (() -> Void)?
@@ -320,59 +509,101 @@ class ClipboardItemView: NSView {
     
     private func setupViews() {
         wantsLayer = true
-        layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.3).cgColor
-        layer?.cornerRadius = 12
-        layer?.borderWidth = 2
-        layer?.borderColor = NSColor.clear.cgColor
+        layer?.backgroundColor = NSColor(white: 0.15, alpha: 0.9).cgColor
+        layer?.cornerRadius = 10
+        layer?.borderWidth = 1.5
+        layer?.borderColor = NSColor(white: 0.3, alpha: 0.5).cgColor
         
-        // 序号标签（左上角）
-        indexLabel.frame = NSRect(x: 10, y: frame.height - 30, width: 40, height: 20)
-        indexLabel.font = .systemFont(ofSize: 12, weight: .bold)
-        indexLabel.textColor = .secondaryLabelColor
-        indexLabel.alignment = .left
-        addSubview(indexLabel)
+        // 添加微妙的阴影效果
+        layer?.shadowColor = NSColor.black.cgColor
+        layer?.shadowOpacity = 0.3
+        layer?.shadowOffset = CGSize(width: 0, height: -2)
+        layer?.shadowRadius = 4
+        
+        let padding: CGFloat = 10
+        let headerHeight: CGFloat = 36
+        let footerHeight: CGFloat = 22
+        
+        // 序号徽章（左上角圆形背景）
+        indexBadge.frame = NSRect(x: padding, y: frame.height - headerHeight, width: 24, height: 24)
+        indexBadge.wantsLayer = true
+        indexBadge.layer?.backgroundColor = NSColor.systemBlue.withAlphaComponent(0.8).cgColor
+        indexBadge.layer?.cornerRadius = 12
+        addSubview(indexBadge)
+        
+        // 序号文字
+        indexLabel.frame = NSRect(x: 0, y: 4, width: 24, height: 16)
+        indexLabel.font = .systemFont(ofSize: 10, weight: .bold)
+        indexLabel.textColor = .white
+        indexLabel.alignment = .center
+        indexLabel.isBezeled = false
+        indexLabel.drawsBackground = false
+        indexBadge.addSubview(indexLabel)
         
         // 图标
-        iconImageView.frame = NSRect(x: 10, y: frame.height - 90, width: 50, height: 50)
+        let iconSize: CGFloat = 28
+        iconImageView.frame = NSRect(x: padding + 30, y: frame.height - headerHeight + 2, width: iconSize, height: iconSize)
         iconImageView.imageScaling = .scaleProportionallyUpOrDown
         addSubview(iconImageView)
         
-        // 标题
-        titleLabel.frame = NSRect(x: 70, y: frame.height - 60, width: frame.width - 80, height: 40)
-        titleLabel.font = .systemFont(ofSize: 13, weight: .medium)
-        titleLabel.textColor = .labelColor
+        // 标题（单行，在图标右侧）
+        titleLabel.frame = NSRect(x: padding + 64, y: frame.height - headerHeight + 4, width: frame.width - padding - 70, height: 20)
+        titleLabel.font = .systemFont(ofSize: 12, weight: .semibold)
+        titleLabel.textColor = .white
         titleLabel.lineBreakMode = .byTruncatingTail
-        titleLabel.maximumNumberOfLines = 2
+        titleLabel.maximumNumberOfLines = 1
+        titleLabel.isBezeled = false
+        titleLabel.drawsBackground = false
         addSubview(titleLabel)
         
-        // 预览文本
-        previewLabel.frame = NSRect(x: 10, y: 35, width: frame.width - 20, height: frame.height - 130)
-        previewLabel.font = .systemFont(ofSize: 11)
-        previewLabel.textColor = .secondaryLabelColor
+        // 预览文本区域（占据中间区域）
+        let previewY = footerHeight + 4
+        let previewHeight = frame.height - headerHeight - footerHeight - 8
+        previewLabel.frame = NSRect(x: padding, y: previewY, width: frame.width - (padding * 2), height: previewHeight)
+        previewLabel.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
+        previewLabel.textColor = NSColor(white: 0.7, alpha: 1.0)
         previewLabel.lineBreakMode = .byTruncatingTail
-        previewLabel.maximumNumberOfLines = 5
+        previewLabel.maximumNumberOfLines = 0 // 允许多行
+        previewLabel.isBezeled = false
+        previewLabel.drawsBackground = false
+        previewLabel.cell?.wraps = true
+        previewLabel.cell?.truncatesLastVisibleLine = true
         addSubview(previewLabel)
         
-        // 时间
-        timeLabel.frame = NSRect(x: 10, y: 10, width: frame.width - 20, height: 18)
-        timeLabel.font = .systemFont(ofSize: 9)
-        timeLabel.textColor = .tertiaryLabelColor
+        // 时间标签（底部右侧）
+        timeLabel.frame = NSRect(x: padding, y: 4, width: frame.width - (padding * 2), height: 16)
+        timeLabel.font = .systemFont(ofSize: 9, weight: .medium)
+        timeLabel.textColor = NSColor(white: 0.5, alpha: 1.0)
         timeLabel.alignment = .right
+        timeLabel.isBezeled = false
+        timeLabel.drawsBackground = false
         addSubview(timeLabel)
     }
     
     func configure(with item: ClipboardItem, index: Int) {
         iconImageView.image = item.icon
         titleLabel.stringValue = item.displayText
-        previewLabel.stringValue = item.previewText.replacingOccurrences(of: "\n", with: " ")
+        // 保留换行符以便多行显示
+        let previewText = item.previewText
+        previewLabel.stringValue = previewText
         timeLabel.stringValue = item.formattedTime
-        indexLabel.stringValue = "#\(index + 1)"
+        indexLabel.stringValue = "\(index + 1)"
         
-        // 如果是图片，调整图标大小
+        // 如果是图片，调整预览显示
         if item.type == .image {
-            iconImageView.frame = NSRect(x: 10, y: frame.height - 120, width: 80, height: 80)
+            // 图片类型使用更大的图标显示缩略图
+            let padding: CGFloat = 10
+            let headerHeight: CGFloat = 36
+            let footerHeight: CGFloat = 22
+            let previewY = footerHeight + 4
+            let previewHeight = frame.height - headerHeight - footerHeight - 8
+            
+            // 将预览区域用于显示图片缩略图
+            iconImageView.frame = NSRect(x: padding, y: previewY, width: frame.width - (padding * 2), height: previewHeight)
             iconImageView.imageScaling = .scaleProportionallyDown
-            titleLabel.frame = NSRect(x: 100, y: frame.height - 80, width: frame.width - 110, height: 60)
+            previewLabel.isHidden = true
+        } else {
+            previewLabel.isHidden = false
         }
     }
     
@@ -380,15 +611,21 @@ class ClipboardItemView: NSView {
         isSelected = selected
         
         if selected {
-            layer?.backgroundColor = NSColor.selectedContentBackgroundColor.withAlphaComponent(0.8).cgColor
+            layer?.backgroundColor = NSColor.systemBlue.withAlphaComponent(0.4).cgColor
             layer?.borderColor = NSColor.systemBlue.cgColor
+            layer?.borderWidth = 2
+            indexBadge.layer?.backgroundColor = NSColor.white.cgColor
+            indexLabel.textColor = NSColor.systemBlue
             titleLabel.textColor = .white
-            previewLabel.textColor = NSColor.white.withAlphaComponent(0.8)
+            previewLabel.textColor = NSColor(white: 0.9, alpha: 1.0)
         } else {
-            layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.3).cgColor
-            layer?.borderColor = NSColor.clear.cgColor
-            titleLabel.textColor = .labelColor
-            previewLabel.textColor = .secondaryLabelColor
+            layer?.backgroundColor = NSColor(white: 0.15, alpha: 0.9).cgColor
+            layer?.borderColor = NSColor(white: 0.3, alpha: 0.5).cgColor
+            layer?.borderWidth = 1.5
+            indexBadge.layer?.backgroundColor = NSColor.systemBlue.withAlphaComponent(0.8).cgColor
+            indexLabel.textColor = .white
+            titleLabel.textColor = .white
+            previewLabel.textColor = NSColor(white: 0.7, alpha: 1.0)
         }
     }
     

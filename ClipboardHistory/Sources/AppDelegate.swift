@@ -1,5 +1,6 @@
 import Cocoa
 import Carbon
+import ApplicationServices
 
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem?
@@ -7,12 +8,47 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var historyWindow: HistoryWindowController?
     var shortcutManager: KeyboardShortcutManager?
     
+    private let singleClickPasteKey = "singleClickPasteEnabled"
+    private let preserveClipboardAfterPasteKey = "preserveClipboardAfterPasteEnabled"
+    private let keyboardNavigatePasteKey = "keyboardNavigatePasteEnabled"
+    private weak var singleClickPasteMenuItem: NSMenuItem?
+    private weak var preserveClipboardMenuItem: NSMenuItem?
+    private weak var keyboardNavigatePasteMenuItem: NSMenuItem?
+
+    /// 最近一次“非本应用”的前台应用，用于把粘贴投递回用户原来的输入焦点处。
+    ///（快捷键触发时，本应用可能已成为 active，直接读 frontmostApplication 会拿错）
+    private(set) var lastNonSelfActiveApp: NSRunningApplication?
+    private var workspaceActivationObserver: NSObjectProtocol?
+    
     func applicationDidFinishLaunching(_ notification: Notification) {
         // 设置应用为后台应用（不显示在 Dock）
         NSApp.setActivationPolicy(.accessory)
         
+        // 默认配置
+        UserDefaults.standard.register(defaults: [
+            singleClickPasteKey: true,
+            preserveClipboardAfterPasteKey: true,
+            // 方向键默认只用于“切换选中”，不自动粘贴；如需可在菜单中手动开启
+            keyboardNavigatePasteKey: false
+        ])
+
+        // 监听前台应用切换，记录“最后一个非本应用”的前台应用
+        workspaceActivationObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            guard let self else { return }
+            guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+            guard app.bundleIdentifier != Bundle.main.bundleIdentifier else { return }
+            self.lastNonSelfActiveApp = app
+        }
+        
         // 创建状态栏图标
         setupStatusBar()
+        
+        // 提示一次辅助功能权限（用于模拟⌘V粘贴）
+        _ = ensureAccessibilityPermission(prompt: false)
         
         // 初始化剪贴板管理器
         clipboardManager = ClipboardManager()
@@ -41,6 +77,25 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let menu = NSMenu()
         
         menu.addItem(NSMenuItem(title: "显示历史 (⌘⌥V)", action: #selector(showHistory), keyEquivalent: ""))
+        
+        let singleClickItem = NSMenuItem(title: "单击即粘贴", action: #selector(toggleSingleClickPaste), keyEquivalent: "")
+        singleClickItem.target = self
+        singleClickItem.state = UserDefaults.standard.bool(forKey: singleClickPasteKey) ? .on : .off
+        menu.addItem(singleClickItem)
+        self.singleClickPasteMenuItem = singleClickItem
+
+        let preserveClipboardItem = NSMenuItem(title: "粘贴后恢复原剪贴板", action: #selector(togglePreserveClipboardAfterPaste), keyEquivalent: "")
+        preserveClipboardItem.target = self
+        preserveClipboardItem.state = UserDefaults.standard.bool(forKey: preserveClipboardAfterPasteKey) ? .on : .off
+        menu.addItem(preserveClipboardItem)
+        self.preserveClipboardMenuItem = preserveClipboardItem
+
+        let keyboardNavigatePasteItem = NSMenuItem(title: "方向键切换时自动粘贴", action: #selector(toggleKeyboardNavigatePaste), keyEquivalent: "")
+        keyboardNavigatePasteItem.target = self
+        keyboardNavigatePasteItem.state = UserDefaults.standard.bool(forKey: keyboardNavigatePasteKey) ? .on : .off
+        menu.addItem(keyboardNavigatePasteItem)
+        self.keyboardNavigatePasteMenuItem = keyboardNavigatePasteItem
+        
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "清空历史", action: #selector(clearHistory), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
@@ -52,6 +107,27 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     
     @objc func showHistory() {
         toggleHistoryWindow()
+    }
+    
+    @objc func toggleSingleClickPaste() {
+        let current = UserDefaults.standard.bool(forKey: singleClickPasteKey)
+        let next = !current
+        UserDefaults.standard.set(next, forKey: singleClickPasteKey)
+        singleClickPasteMenuItem?.state = next ? .on : .off
+    }
+
+    @objc func togglePreserveClipboardAfterPaste() {
+        let current = UserDefaults.standard.bool(forKey: preserveClipboardAfterPasteKey)
+        let next = !current
+        UserDefaults.standard.set(next, forKey: preserveClipboardAfterPasteKey)
+        preserveClipboardMenuItem?.state = next ? .on : .off
+    }
+
+    @objc func toggleKeyboardNavigatePaste() {
+        let current = UserDefaults.standard.bool(forKey: keyboardNavigatePasteKey)
+        let next = !current
+        UserDefaults.standard.set(next, forKey: keyboardNavigatePasteKey)
+        keyboardNavigatePasteMenuItem?.state = next ? .on : .off
     }
     
     @objc func clearHistory() {
@@ -94,12 +170,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if let window = historyWindow?.window, window.isVisible {
             window.orderOut(nil)
         } else {
-            historyWindow?.showWindow(clipboardManager?.history ?? [])
+            _ = ensureAccessibilityPermission(prompt: false)
+            historyWindow?.showWindow(clipboardManager?.history ?? [], previousActiveApp: lastNonSelfActiveApp)
         }
+    }
+    
+    /// 用于模拟键盘事件（⌘V）所需的辅助功能权限。此处只做“是否授权”的检测与可选弹窗引导。
+    @discardableResult
+    private func ensureAccessibilityPermission(prompt: Bool) -> Bool {
+        let promptKey = kAXTrustedCheckOptionPrompt.takeUnretainedValue()
+        let options: [CFString: Any] = [promptKey: prompt]
+        return AXIsProcessTrustedWithOptions(options as CFDictionary)
     }
     
     func applicationWillTerminate(_ notification: Notification) {
         clipboardManager?.stopMonitoring()
         shortcutManager?.unregisterHotKey()
+        if let observer = workspaceActivationObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(observer)
+        }
     }
 }

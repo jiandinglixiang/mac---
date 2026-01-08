@@ -9,6 +9,12 @@ class ClipboardManager {
     private let maxHistorySize = 200
     private let userDefaults = UserDefaults.standard
     private let historyKey = "clipboardHistory"
+    private var ignoreChangesRemaining: Int = 0
+
+    struct PasteboardSnapshot {
+        let items: [NSPasteboardItem]
+        let changeCount: Int
+    }
     
     init() {
         lastChangeCount = pasteboard.changeCount
@@ -38,6 +44,10 @@ class ClipboardManager {
         
         if changeCount != lastChangeCount {
             lastChangeCount = changeCount
+            if ignoreChangesRemaining > 0 {
+                ignoreChangesRemaining -= 1
+                return
+            }
             captureClipboard()
         }
     }
@@ -153,6 +163,33 @@ class ClipboardManager {
         }
         
         // 更新 changeCount 以避免重复捕获
+        lastChangeCount = pasteboard.changeCount
+    }
+
+    /// 复制当前剪贴板内容（尽量完整保留所有 pasteboard types），用于“粘贴后恢复剪贴板”。
+    func snapshotPasteboard() -> PasteboardSnapshot {
+        let currentItems = pasteboard.pasteboardItems ?? []
+        let copiedItems: [NSPasteboardItem] = currentItems.map { item in
+            let newItem = NSPasteboardItem()
+            for type in item.types {
+                if let data = item.data(forType: type) {
+                    newItem.setData(data, forType: type)
+                } else if let str = item.string(forType: type) {
+                    newItem.setString(str, forType: type)
+                }
+            }
+            return newItem
+        }
+        return PasteboardSnapshot(items: copiedItems, changeCount: pasteboard.changeCount)
+    }
+
+    /// 恢复剪贴板到指定快照。
+    func restorePasteboard(from snapshot: PasteboardSnapshot) {
+        ignoreChangesRemaining += 1
+        pasteboard.clearContents()
+        if !snapshot.items.isEmpty {
+            _ = pasteboard.writeObjects(snapshot.items)
+        }
         lastChangeCount = pasteboard.changeCount
     }
     

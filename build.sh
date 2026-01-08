@@ -37,11 +37,25 @@ echo -e "${YELLOW}编译 Swift 源代码...${NC}"
 # 自动检测 SDK 路径
 SDK_PATH=$(xcrun --show-sdk-path)
 
+# 自动检测架构（Apple Silicon: arm64 / Intel: x86_64）
+ARCH=$(uname -m)
+if [ "$ARCH" = "arm64" ]; then
+    TARGET="arm64-apple-macosx11.0"
+else
+    TARGET="x86_64-apple-macosx11.0"
+fi
+
+# 模块缓存路径（避免写入用户目录导致权限问题）
+MODULE_CACHE="$BUILD_DIR/ModuleCache"
+mkdir -p "$MODULE_CACHE"
+
 swiftc -O \
     -sdk "$SDK_PATH" \
-    -target x86_64-apple-macosx11.0 \
+    -target "$TARGET" \
+    -module-cache-path "$MODULE_CACHE" \
     -framework Cocoa \
     -framework Carbon \
+    -framework ApplicationServices \
     "$PROJECT_DIR/ClipboardHistory/Sources/ClipboardItem.swift" \
     "$PROJECT_DIR/ClipboardHistory/Sources/ClipboardManager.swift" \
     "$PROJECT_DIR/ClipboardHistory/Sources/KeyboardShortcutManager.swift" \
@@ -91,7 +105,7 @@ echo "使用方法："
 echo "1. 双击打开 '$APP_NAME.app'"
 echo "2. 首次运行需要授予辅助功能权限："
 echo "   系统设置 -> 隐私与安全性 -> 辅助功能 -> 添加应用"
-echo "3. 使用快捷键 ⌘⇧V 唤起剪贴板历史"
+echo "3. 使用快捷键 ⌘⌥V 唤起剪贴板历史"
 echo ""
 echo -e "${GREEN}提示：${NC}可以将应用拖动到「应用程序」文件夹中安装"
 echo ""
