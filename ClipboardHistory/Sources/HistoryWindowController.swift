@@ -39,6 +39,7 @@ class HistoryWindowController: NSWindowController, NSWindowDelegate {
     private var selectedIndex: Int = 0
     private var previousActiveApp: NSRunningApplication?  // 记住之前的活动应用
     private var appearanceObserver: NSObjectProtocol?
+    private var isRestoringFocus: Bool = false
     
     override var window: NSWindow? {
         get { return window_ }
@@ -325,7 +326,7 @@ class HistoryWindowController: NSWindowController, NSWindowDelegate {
         let targetApp = previousActiveApp
 
         // 关闭窗口
-        hideWindow()
+        hideWindow(restoreFocus: false)
 
         // 先激活之前的应用，再执行粘贴
         // 优化：缩短等待时间以提高响应速度
@@ -400,14 +401,41 @@ class HistoryWindowController: NSWindowController, NSWindowDelegate {
         return true
     }
     
-    func hideWindow() {
+    /// 隐藏窗口。可选：把焦点恢复回唤起前的应用（避免 Esc/点空白关闭后“输入焦点丢失”）。
+    func hideWindow(restoreFocus: Bool = false) {
         window?.orderOut(nil)
+        if restoreFocus {
+            restorePreviousFocusIfPossible()
+        }
+    }
+
+    /// 显式恢复到唤起前的输入焦点（尽量激活之前的前台应用）。
+    private func restorePreviousFocusIfPossible() {
+        // 多条关闭路径可能会触发多次（例如鼠标点空白 + resignKey），做一次轻量去重。
+        if isRestoringFocus { return }
+        isRestoringFocus = true
+
+        // 如果本地没有记到，回退取 AppDelegate 里记录的“最后一个非本应用前台App”
+        if previousActiveApp == nil, let appDelegate = NSApp.delegate as? AppDelegate {
+            previousActiveApp = appDelegate.lastNonSelfActiveApp
+        }
+
+        guard let app = previousActiveApp else {
+            isRestoringFocus = false
+            return
+        }
+
+        // 稍微延迟，让 orderOut 完成，避免本应用仍处于 active 但无 key window 的中间态。
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.01) { [weak self] in
+            app.activate(options: [.activateIgnoringOtherApps])
+            self?.isRestoringFocus = false
+        }
     }
     
     func handleKeyDown(with event: NSEvent) {
         switch event.keyCode {
         case 53: // ESC
-            hideWindow()
+            hideWindow(restoreFocus: true)
         case 36, 76: // Enter (主键盘36, 小键盘76)
             if selectedIndex >= 0 && selectedIndex < items.count {
                 selectAndPaste(items[selectedIndex])
@@ -420,7 +448,9 @@ class HistoryWindowController: NSWindowController, NSWindowDelegate {
             if selectedIndex > 0 {
                 selectItem(at: selectedIndex - 1)
             }
-        case 51: // Delete/Backspace
+        case 51, 117:
+            // 51: Backspace/⌫（键帽通常写 Delete）
+            // 117: Forward Delete/⌦（外接键盘的 Del，或 Mac 上 fn+Delete）
             if selectedIndex >= 0 && selectedIndex < items.count {
                 deleteItem(at: selectedIndex)
             }
@@ -458,7 +488,9 @@ class HistoryWindowController: NSWindowController, NSWindowDelegate {
     // NSWindowDelegate 方法
     func windowDidResignKey(_ notification: Notification) {
         // 当窗口失去焦点时，隐藏窗口
-        hideWindow()
+        // 这里不主动“恢复焦点”，因为用户可能是点击到别的应用/窗口想切走焦点，
+        // 我们不应把焦点强行拉回唤起前的应用。
+        hideWindow(restoreFocus: false)
     }
 }
 
@@ -548,7 +580,7 @@ class ClickThroughView: NSView {
         }
         
         // 未点击到任何卡片：隐藏窗口
-        windowController?.hideWindow()
+        windowController?.hideWindow(restoreFocus: true)
     }
     
     override func keyDown(with event: NSEvent) {

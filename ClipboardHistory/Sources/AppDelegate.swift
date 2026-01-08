@@ -130,7 +130,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     
     func toggleHistoryWindow() {
         if let window = historyWindow?.window, window.isVisible {
-            window.orderOut(nil)
+            // 再次按快捷键关闭时，也恢复到唤起前的输入焦点，避免焦点丢失
+            historyWindow?.hideWindow(restoreFocus: true)
         } else {
             // 只有在“自动模拟粘贴(⌘V)”路径下才需要辅助功能权限；
             // 现已移除“仅写入系统剪贴板”选项，默认总是模拟粘贴，因此总是检查权限。
