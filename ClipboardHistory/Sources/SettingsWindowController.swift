@@ -8,9 +8,12 @@ final class SettingsWindowController: NSWindowController {
     private let historyValueLabel = NSTextField(labelWithString: "")
     private let cardValueLabel = NSTextField(labelWithString: "")
     
+    private let optionVSystemClipboardCheckbox = NSButton(checkboxWithTitle: "启用 ⌥V 打开系统剪贴板", target: nil, action: nil)
+    private let optionVSystemClipboardHintLabel = NSTextField(labelWithString: "触发顺序：⌘Space →（延迟）→ ⌘4")
+    
     init() {
         let panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 420, height: 200),
+            contentRect: NSRect(x: 0, y: 0, width: 420, height: 260),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -44,6 +47,9 @@ final class SettingsWindowController: NSWindowController {
         let title = NSTextField(labelWithString: "外观")
         title.font = .systemFont(ofSize: 14, weight: .semibold)
         
+        let featureTitle = NSTextField(labelWithString: "功能")
+        featureTitle.font = .systemFont(ofSize: 14, weight: .semibold)
+        
         historyAlphaSlider.target = self
         historyAlphaSlider.action = #selector(onSliderChanged(_:))
         historyAlphaSlider.isContinuous = true
@@ -57,6 +63,12 @@ final class SettingsWindowController: NSWindowController {
         
         cardValueLabel.font = .systemFont(ofSize: 11, weight: .medium)
         cardValueLabel.textColor = .secondaryLabelColor
+        
+        optionVSystemClipboardCheckbox.target = self
+        optionVSystemClipboardCheckbox.action = #selector(onOptionVSystemClipboardChanged(_:))
+        
+        optionVSystemClipboardHintLabel.font = .systemFont(ofSize: 11, weight: .regular)
+        optionVSystemClipboardHintLabel.textColor = .secondaryLabelColor
         
         let historyRow = labeledSliderRow(
             label: "历史窗口背景透明度",
@@ -81,7 +93,12 @@ final class SettingsWindowController: NSWindowController {
         buttons.distribution = .gravityAreas
         buttons.spacing = 10
         
-        let stack = NSStackView(views: [title, historyRow, cardRow, buttons])
+        let featureStack = NSStackView(views: [optionVSystemClipboardCheckbox, optionVSystemClipboardHintLabel])
+        featureStack.orientation = .vertical
+        featureStack.alignment = .leading
+        featureStack.spacing = 6
+        
+        let stack = NSStackView(views: [title, historyRow, cardRow, featureTitle, featureStack, buttons])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 14
@@ -126,6 +143,7 @@ final class SettingsWindowController: NSWindowController {
     private func syncFromDefaults() {
         historyAlphaSlider.doubleValue = Double(AppearanceSettings.historyBackgroundAlpha)
         cardAlphaSlider.doubleValue = Double(AppearanceSettings.cardBackgroundAlpha)
+        optionVSystemClipboardCheckbox.state = FeatureSettings.enableOptionVSystemClipboard ? .on : .off
         refreshValueLabels()
     }
     
@@ -145,11 +163,16 @@ final class SettingsWindowController: NSWindowController {
     
     @objc private func onReset() {
         AppearanceSettings.resetToDefaults()
+        FeatureSettings.resetToDefaults()
         syncFromDefaults()
     }
     
     @objc private func onClose() {
         window?.close()
+    }
+    
+    @objc private func onOptionVSystemClipboardChanged(_ sender: NSButton) {
+        FeatureSettings.setEnableOptionVSystemClipboard(sender.state == .on)
     }
 }
 
