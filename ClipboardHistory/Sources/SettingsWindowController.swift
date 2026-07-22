@@ -22,12 +22,20 @@ final class SettingsWindowController: NSWindowController {
     
     private let controlVSystemClipboardCheckbox = NSButton(checkboxWithTitle: "启用 ⌃V 打开系统剪贴板", target: nil, action: nil)
     private let controlVSystemClipboardHintLabel = NSTextField(labelWithString: "触发顺序：⌘Space →（延迟）→ ⌘4")
-    
+
+    // MARK: - 风扇设置控件（按机型自适应：双风扇=左/右，单风扇=单项，无风扇=隐藏）
+
+    private let fanCount = FanControl.fanCount()
+    private var fanCheckboxes: [NSButton] = []   // tag = 风扇序号（0=左，1=右）
+    private let fanStatusLabel = NSTextField(labelWithString: "")
+    private let fanHintLabel = NSTextField(labelWithString: "勾选需管理员授权（Touch ID/密码）；睡眠或重启后系统可能恢复自动")
+
     // MARK: - 初始化
-    
+
     init() {
+        let height: CGFloat = fanCount > 0 ? 500 : 400
         let panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 420, height: 400),
+            contentRect: NSRect(x: 0, y: 0, width: 420, height: height),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -48,6 +56,7 @@ final class SettingsWindowController: NSWindowController {
     }
     
     func show() {
+        syncFanSection()
         NSApp.activate(ignoringOtherApps: true)
         window?.center()
         window?.makeKeyAndOrderFront(nil)
@@ -104,7 +113,13 @@ final class SettingsWindowController: NSWindowController {
         
         controlVSystemClipboardHintLabel.font = .systemFont(ofSize: 11, weight: .regular)
         controlVSystemClipboardHintLabel.textColor = .secondaryLabelColor
-        
+
+        // 风扇控件设置
+        fanStatusLabel.font = .systemFont(ofSize: 11, weight: .regular)
+        fanStatusLabel.textColor = .secondaryLabelColor
+        fanHintLabel.font = .systemFont(ofSize: 11, weight: .regular)
+        fanHintLabel.textColor = .secondaryLabelColor
+
         // 外观滑块行
         let historyRow = labeledSliderRow(
             label: "历史窗口背景透明度",
@@ -147,13 +162,35 @@ final class SettingsWindowController: NSWindowController {
         featureStack.alignment = .leading
         featureStack.spacing = 4
         
+        // 风扇设置堆叠（风扇 0=左，风扇 1=右；无风扇机型不显示该区块）
+        var fanSectionViews: [NSView] = []
+        if fanCount > 0 {
+            let fanTitle = NSTextField(labelWithString: "风扇")
+            fanTitle.font = .systemFont(ofSize: 14, weight: .semibold)
+
+            let names = fanCount >= 2 ? ["左风扇满速", "右风扇满速"] : ["风扇满速"]
+            for i in 0..<min(fanCount, names.count) {
+                let cb = NSButton(checkboxWithTitle: names[i], target: self, action: #selector(onFanCheckboxChanged(_:)))
+                cb.tag = i
+                fanCheckboxes.append(cb)
+            }
+
+            let fanStack = NSStackView(views: fanCheckboxes + [fanStatusLabel, fanHintLabel])
+            fanStack.orientation = .vertical
+            fanStack.alignment = .leading
+            fanStack.spacing = 4
+            fanSectionViews = [fanTitle, fanStack]
+        }
+
         // 主布局堆叠
-        let stack = NSStackView(views: [
+        var mainViews: [NSView] = [
             generalTitle, generalStack,
             appearanceTitle, historyRow, cardRow,
-            featureTitle, featureStack,
-            buttons
-        ])
+            featureTitle, featureStack
+        ]
+        mainViews.append(contentsOf: fanSectionViews)
+        mainViews.append(buttons)
+        let stack = NSStackView(views: mainViews)
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 14
@@ -203,7 +240,68 @@ final class SettingsWindowController: NSWindowController {
         optionVAppClipboardCheckbox.state = FeatureSettings.enableOptionVAppClipboard ? .on : .off
         controlVSystemClipboardCheckbox.state = FeatureSettings.enableControlVSystemClipboard ? .on : .off
         launchAtLoginCheckbox.state = FeatureSettings.launchAtLogin ? .on : .off
+        syncFanSection()
         refreshValueLabels()
+    }
+
+    // MARK: - 风扇控制
+
+    private var fanOperationInProgress = false
+
+    /// 只刷新转速标签（不触碰复选框，避免 SMC 读取瞬时失败导致复选框回退）
+    private func refreshFanRPM() {
+        guard fanCount > 0 else { return }
+        let names = fanCount >= 2 ? ["左", "右"] : [""]
+        let parts = fanCheckboxes.map { cb -> String in
+            let rpm = FanControl.actualRPM(cb.tag).map { "\($0)" } ?? "?"
+            return names[cb.tag].isEmpty ? "\(rpm) RPM" : "\(names[cb.tag]) \(rpm) RPM"
+        }
+        fanStatusLabel.stringValue = "当前转速：" + parts.joined(separator: " · ")
+    }
+
+    /// 以硬件真实状态刷新风扇区块：复选框 = SMC 强制模式位，状态行 = 实时转速
+    private func syncFanSection() {
+        guard fanCount > 0 else { return }
+        guard !fanOperationInProgress else { return }  // 操作中不刷新，避免覆盖中间状态
+        for cb in fanCheckboxes {
+            cb.state = (FanControl.isForced(cb.tag) ?? false) ? .on : .off
+        }
+        let names = fanCount >= 2 ? ["左", "右"] : [""]
+        let parts = fanCheckboxes.map { cb -> String in
+            let rpm = FanControl.actualRPM(cb.tag).map { "\($0)" } ?? "?"
+            return names[cb.tag].isEmpty ? "\(rpm) RPM" : "\(names[cb.tag]) \(rpm) RPM"
+        }
+        fanStatusLabel.stringValue = "当前转速：" + parts.joined(separator: " · ")
+    }
+
+    @objc private func onFanCheckboxChanged(_ sender: NSButton) {
+        guard !fanOperationInProgress else {
+            sender.state = sender.state == .on ? .off : .on
+            return
+        }
+        fanOperationInProgress = true
+        let fan = sender.tag
+        let enabled = sender.state == .on
+        sender.isEnabled = false
+
+        FanControl.applyFullSpeed(fan, enabled: enabled) { [weak self, weak sender] result in
+            guard let self else { return }
+            self.fanOperationInProgress = false
+            sender?.isEnabled = true
+            switch result {
+            case .success:
+                refreshFanRPM()  // 只刷新转速，不动复选框（系统已正确切换）
+            case .failure(let error):
+                sender?.state = enabled ? .off : .on  // 失败则回退
+                if case .cancelled = error { return }
+                let alert = NSAlert()
+                alert.messageText = "无法控制风扇"
+                alert.informativeText = error.localizedDescription
+                alert.alertStyle = .warning
+                alert.addButton(withTitle: "确定")
+                alert.runModal()
+            }
+        }
     }
     
     private func refreshValueLabels() {
@@ -250,6 +348,33 @@ final class SettingsWindowController: NSWindowController {
         AppearanceSettings.resetToDefaults()
         FeatureSettings.resetToDefaults()
         syncFromDefaults()
+        // ponytail: 恢复默认=系统自动（取消满速）。先乐观取消勾选，避免末尾回读 SMC（切换滞后）把已发的 auto 指令又显示成勾选，导致要点两次
+        for cb in fanCheckboxes { cb.state = .off }
+        restoreNextFan()
+    }
+
+    /// 不读 SMC 状态，直接对所有风扇串行发送 auto 命令（已自动的重复发送无副作用）
+    private func restoreNextFan(_ index: Int = 0) {
+        guard !fanOperationInProgress, index < fanCheckboxes.count else {
+            // ponytail: 末尾只刷新转速，不再回读 SMC 重置勾选状态（SMC 切换有滞后，回读会重新勾上导致要点两次）
+            if index >= fanCheckboxes.count { refreshFanRPM() }
+            return
+        }
+        let cb = fanCheckboxes[index]
+        guard cb.isEnabled else {
+            restoreNextFan(index + 1)
+            return
+        }
+        fanOperationInProgress = true
+        cb.isEnabled = false
+        FanControl.applyFullSpeed(cb.tag, enabled: false) { [weak self, weak cb] result in
+            DispatchQueue.main.async {
+                cb?.isEnabled = true
+                if case .success = result { cb?.state = .off }
+                self?.fanOperationInProgress = false
+                self?.restoreNextFan(index + 1)
+            }
+        }
     }
     
     @objc private func onClose() {

@@ -60,6 +60,7 @@ SRC_FILES=(
     "$PROJECT_DIR/ClipboardHistory/Sources/SettingsWindowController.swift"
     "$PROJECT_DIR/ClipboardHistory/Sources/AppearanceSettings.swift"
     "$PROJECT_DIR/ClipboardHistory/Sources/FeatureSettings.swift"
+    "$PROJECT_DIR/ClipboardHistory/Sources/FanControl.swift"
     "$PROJECT_DIR/ClipboardHistory/Sources/AppDelegate.swift"
     "$PROJECT_DIR/ClipboardHistory/Sources/main.swift"
 )
@@ -84,6 +85,7 @@ build_one_arch() {
         -framework Carbon \
         -framework ApplicationServices \
         -framework ServiceManagement \
+        -framework IOKit \
         "${SRC_FILES[@]}" \
         -o "$out_bin"
 }
