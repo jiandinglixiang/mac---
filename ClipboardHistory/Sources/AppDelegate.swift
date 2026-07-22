@@ -19,13 +19,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // 设置应用为后台应用（不显示在 Dock）
         NSApp.setActivationPolicy(.accessory)
         
+        // 旧版设置迁移（必须在 register(defaults:) 之前执行）
+        FeatureSettings.migrateLegacyKeys()
+        
         // 默认配置
         UserDefaults.standard.register(defaults: [
             // 外观默认值
             AppearanceSettings.historyBackgroundAlphaKey: 0.9,
             AppearanceSettings.cardBackgroundAlphaKey: 0.85,
             // 功能开关默认值
-            FeatureSettings.enableOptionVSystemClipboardKey: false
+            FeatureSettings.enableOptionVAppClipboardKey: true,
+            FeatureSettings.enableControlVSystemClipboardKey: false
         ])
 
         // 监听前台应用切换，记录“最后一个非本应用”的前台应用
@@ -55,19 +59,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         
         // 设置快捷键
         shortcutManager = KeyboardShortcutManager()
-        // 1) ⌘⌥V：唤起本应用历史窗口（固定存在）
-        shortcutManager?.registerHotKey(id: 1, keyCode: UInt32(kVK_ANSI_V), modifiers: [.command, .option]) { [weak self] in
-            self?.toggleHistoryWindow()
-        }
+        updateAllHotKeyRegistrations()
         
-        // 2) ⌥V：可选功能（由设置开关控制）
-        updateOptionVHotKeyRegistration()
+        // 监听功能设置变更，动态更新快捷键注册
         featureSettingsObserver = NotificationCenter.default.addObserver(
             forName: .featureSettingsDidChange,
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            self?.updateOptionVHotKeyRegistration()
+            self?.updateAllHotKeyRegistrations()
         }
         
         print("剪贴板历史工具已启动")
@@ -83,7 +83,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // 创建菜单
         let menu = NSMenu()
         
-        menu.addItem(NSMenuItem(title: "显示历史 (⌘⌥V)", action: #selector(showHistory), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "显示历史 (⌥V)", action: #selector(showHistory), keyEquivalent: ""))
         
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "清空历史", action: #selector(clearHistory), keyEquivalent: ""))
@@ -121,10 +121,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         功能特性:
         • 自动保存剪贴板历史
         • 支持文本、图片、文件、链接
-        • 快捷键: ⌘⌥V 唤起历史窗口
+        • 快捷键: ⌥V 唤起历史窗口（可在设置中关闭）
+        • 可选: ⌃V 唤起系统剪贴板（可在设置中开启）
         • 横向滚动选择历史记录
         
-        仅支持 macOS 系统
+        仅支持 macOS 13.0 及以上系统
         """
         alert.alertStyle = .informational
         alert.addButton(withTitle: "确定")
@@ -142,11 +143,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         NSApplication.shared.terminate(nil)
     }
     
-    private func updateOptionVHotKeyRegistration() {
+    /// 根据设置动态注册/注销所有快捷键
+    private func updateAllHotKeyRegistrations() {
         guard let shortcutManager else { return }
         
-        if FeatureSettings.enableOptionVSystemClipboard {
-            shortcutManager.registerHotKey(id: 2, keyCode: UInt32(kVK_ANSI_V), modifiers: [.option]) { [weak self] in
+        // id=1: ⌥V -> 唤起本应用剪贴板历史窗口
+        if FeatureSettings.enableOptionVAppClipboard {
+            shortcutManager.registerHotKey(id: 1, keyCode: UInt32(kVK_ANSI_V), modifiers: [.option]) { [weak self] in
+                self?.toggleHistoryWindow()
+            }
+        } else {
+            shortcutManager.unregisterHotKey(id: 1)
+        }
+        
+        // id=2: ⌃V -> 触发系统剪贴板（通过 Spotlight）
+        if FeatureSettings.enableControlVSystemClipboard {
+            shortcutManager.registerHotKey(id: 2, keyCode: UInt32(kVK_ANSI_V), modifiers: [.control]) { [weak self] in
                 self?.triggerSystemClipboardViaSpotlight()
             }
         } else {
@@ -154,7 +166,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
     
-    /// ⌥V 触发：模拟 ⌘Space，然后延迟模拟 ⌘4（用户可用于唤起“系统剪贴板/第三方剪贴板”等）
+    /// ⌃V 触发：模拟 ⌘Space，然后延迟模拟 ⌘4（用户可用于唤起“系统剪贴板/第三方剪贴板”等）
     private func triggerSystemClipboardViaSpotlight() {
         guard ensureAccessibilityPermissionOrAlert() else { return }
         

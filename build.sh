@@ -50,7 +50,7 @@ if [ "$HOST_ARCH" != "arm64" ]; then
 fi
 
 # 仅构建 arm64（Apple Silicon）
-TARGET_ARM64="arm64-apple-macosx11.0"
+TARGET_ARM64="arm64-apple-macosx13.0"
 
 SRC_FILES=(
     "$PROJECT_DIR/ClipboardHistory/Sources/ClipboardItem.swift"
@@ -83,6 +83,7 @@ build_one_arch() {
         -framework Cocoa \
         -framework Carbon \
         -framework ApplicationServices \
+        -framework ServiceManagement \
         "${SRC_FILES[@]}" \
         -o "$out_bin"
 }
@@ -131,7 +132,7 @@ echo "使用方法："
 echo "1. 双击打开 '$APP_NAME.app'"
 echo "2. 首次运行需要授予辅助功能权限："
 echo "   系统设置 -> 隐私与安全性 -> 辅助功能 -> 添加应用"
-echo "3. 使用快捷键 ⌘⌥V 唤起剪贴板历史"
+echo "3. 使用快捷键 ⌥V 唤起剪贴板历史"
 echo ""
 echo -e "${GREEN}提示：${NC}可以将应用拖动到「应用程序」文件夹中安装"
 echo ""
