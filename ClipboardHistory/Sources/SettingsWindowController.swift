@@ -27,8 +27,9 @@ final class SettingsWindowController: NSWindowController {
 
     private let fanCount = FanControl.fanCount()
     private var fanCheckboxes: [NSButton] = []   // tag = 风扇序号（0=左，1=右）
+    private var fanStateObserver: NSObjectProtocol?
     private let fanStatusLabel = NSTextField(labelWithString: "")
-    private let fanHintLabel = NSTextField(labelWithString: "勾选需管理员授权（Touch ID/密码）；睡眠或重启后系统可能恢复自动")
+    private let fanHintLabel = NSTextField(labelWithString: "勾选后目标转速为最高转速的 80%（非满速，兼顾散热与噪音）；首次勾选需管理员授权（Touch ID/密码），被系统回收时会自动补发")
 
     // MARK: - 初始化
 
@@ -49,13 +50,24 @@ final class SettingsWindowController: NSWindowController {
         
         setupUI(in: panel)
         syncFromDefaults()
+        
+        // 后台巡检器补发/放弃后同步界面
+        fanStateObserver = NotificationCenter.default.addObserver(
+            forName: .fanStateDidChange, object: nil, queue: .main
+        ) { [weak self] _ in self?.syncFanSection() }
     }
     
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
     }
     
+    deinit {
+        if let fanStateObserver { NotificationCenter.default.removeObserver(fanStateObserver) }
+    }
+    
     func show() {
+        // isForced() 已正确区分 Mode 1/2（用户强制）vs Mode 3（系统接管），
+        // 因此可以从 SMC 同步；同时交叉验证 RPM 防止误报。
         syncFanSection()
         NSApp.activate(ignoringOtherApps: true)
         window?.center()
@@ -168,7 +180,7 @@ final class SettingsWindowController: NSWindowController {
             let fanTitle = NSTextField(labelWithString: "风扇")
             fanTitle.font = .systemFont(ofSize: 14, weight: .semibold)
 
-            let names = fanCount >= 2 ? ["左风扇满速", "右风扇满速"] : ["风扇满速"]
+            let names = fanCount >= 2 ? ["左风扇高速（80%）", "右风扇高速（80%）"] : ["风扇高速（80%）"]
             for i in 0..<min(fanCount, names.count) {
                 let cb = NSButton(checkboxWithTitle: names[i], target: self, action: #selector(onFanCheckboxChanged(_:)))
                 cb.tag = i
@@ -259,19 +271,46 @@ final class SettingsWindowController: NSWindowController {
         fanStatusLabel.stringValue = "当前转速：" + parts.joined(separator: " · ")
     }
 
-    /// 以硬件真实状态刷新风扇区块：复选框 = SMC 强制模式位，状态行 = 实时转速
+    /// 以硬件真实状态刷新风扇区块：复选框 = SMC 模式位（Mode 1/2 才算手动，Mode 3=系统接管不算）。
+    /// 实际转速只用于「是否还在爬升」的提示，不再反过来推翻复选框——风扇从怠速爬到目标
+    /// 需要数秒，用瞬时 RPM 判定会把刚勾选上的状态误清掉。SMC 不可用时回退 UserDefaults。
     private func syncFanSection() {
         guard fanCount > 0 else { return }
-        guard !fanOperationInProgress else { return }  // 操作中不刷新，避免覆盖中间状态
-        for cb in fanCheckboxes {
-            cb.state = (FanControl.isForced(cb.tag) ?? false) ? .on : .off
-        }
+        guard !fanOperationInProgress else { return }
+
         let names = fanCount >= 2 ? ["左", "右"] : [""]
-        let parts = fanCheckboxes.map { cb -> String in
-            let rpm = FanControl.actualRPM(cb.tag).map { "\($0)" } ?? "?"
-            return names[cb.tag].isEmpty ? "\(rpm) RPM" : "\(names[cb.tag]) \(rpm) RPM"
+        var parts: [String] = []
+        var ramping: [String] = []
+
+        for cb in fanCheckboxes {
+            let fanIdx = cb.tag
+            let rpmStr = FanControl.actualRPM(fanIdx).map { "\($0)" } ?? "?"
+            let target = FanControl.targetRPM(fanIdx)
+
+            if let forced = FanControl.isForced(fanIdx) {
+                cb.state = forced ? .on : .off
+                // 已手动但转速还没爬到目标的 60%：只是「加速中」，不是失效
+                if forced,
+                   let actual = FanControl.actualRPM(fanIdx),
+                   let target, actual < Int(Double(target) * 0.6) {
+                    let name = names.indices.contains(fanIdx) ? names[fanIdx] : ""
+                    ramping.append(name.isEmpty ? "风扇" : "\(name)风扇")
+                }
+            } else {
+                // SMC 不可用，回退到上次用户操作结果
+                cb.state = UserDefaults.standard.bool(forKey: FanControl.enabledKey(fanIdx)) ? .on : .off
+            }
+
+            let name = names.indices.contains(fanIdx) && !names[fanIdx].isEmpty ? "\(names[fanIdx]) " : ""
+            let targetStr = target.map { " / 目标 \($0)" } ?? ""
+            parts.append("\(name)\(rpmStr)\(targetStr) RPM")
         }
-        fanStatusLabel.stringValue = "当前转速：" + parts.joined(separator: " · ")
+
+        var status = "当前转速：" + parts.joined(separator: " · ")
+        if !ramping.isEmpty {
+            status += "（\(ramping.joined(separator: "、"))加速中）"
+        }
+        fanStatusLabel.stringValue = status
     }
 
     @objc private func onFanCheckboxChanged(_ sender: NSButton) {
@@ -284,13 +323,19 @@ final class SettingsWindowController: NSWindowController {
         let enabled = sender.state == .on
         sender.isEnabled = false
 
-        FanControl.applyFullSpeed(fan, enabled: enabled) { [weak self, weak sender] result in
+        FanControl.apply(fan, boost: enabled) { [weak self, weak sender] result in
             guard let self else { return }
             self.fanOperationInProgress = false
             sender?.isEnabled = true
             switch result {
             case .success:
-                refreshFanRPM()  // 只刷新转速，不动复选框（系统已正确切换）
+                // 持久化用户意图（SMC 不可用时的回退 + 巡检器据此补发）
+                FanSupervisor.shared.setBoosted(fan, enabled)
+                self.syncFanSection()  // 重新从 SMC 读取模式位
+                // 转速爬到目标需要几秒，延后刷新一次数值显示
+                DispatchQueue.main.asyncAfter(deadline: .now() + 6) { [weak self] in
+                    self?.syncFanSection()
+                }
             case .failure(let error):
                 sender?.state = enabled ? .off : .on  // 失败则回退
                 if case .cancelled = error { return }
@@ -348,29 +393,35 @@ final class SettingsWindowController: NSWindowController {
         AppearanceSettings.resetToDefaults()
         FeatureSettings.resetToDefaults()
         syncFromDefaults()
-        // ponytail: 恢复默认=系统自动（取消满速）。先乐观取消勾选，避免末尾回读 SMC（切换滞后）把已发的 auto 指令又显示成勾选，导致要点两次
-        for cb in fanCheckboxes { cb.state = .off }
+        // 恢复默认 = 系统自动（取消提速）
+        for cb in fanCheckboxes {
+            cb.state = .off
+            FanSupervisor.shared.setBoosted(cb.tag, false)
+        }
         restoreNextFan()
     }
 
     /// 不读 SMC 状态，直接对所有风扇串行发送 auto 命令（已自动的重复发送无副作用）
     private func restoreNextFan(_ index: Int = 0) {
         guard !fanOperationInProgress, index < fanCheckboxes.count else {
-            // ponytail: 末尾只刷新转速，不再回读 SMC 重置勾选状态（SMC 切换有滞后，回读会重新勾上导致要点两次）
             if index >= fanCheckboxes.count { refreshFanRPM() }
             return
         }
         let cb = fanCheckboxes[index]
+        let fanIdx = cb.tag
         guard cb.isEnabled else {
             restoreNextFan(index + 1)
             return
         }
         fanOperationInProgress = true
         cb.isEnabled = false
-        FanControl.applyFullSpeed(cb.tag, enabled: false) { [weak self, weak cb] result in
+        FanControl.apply(fanIdx, boost: false) { [weak self, weak cb] result in
             DispatchQueue.main.async {
                 cb?.isEnabled = true
-                if case .success = result { cb?.state = .off }
+                if case .success = result {
+                    cb?.state = .off
+                    FanSupervisor.shared.setBoosted(fanIdx, false)
+                }
                 self?.fanOperationInProgress = false
                 self?.restoreNextFan(index + 1)
             }

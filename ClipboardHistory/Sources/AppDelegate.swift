@@ -50,6 +50,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // 提示一次辅助功能权限（用于模拟⌘V粘贴）
         _ = ensureAccessibilityPermission(prompt: false)
         
+        // 恢复上次的风扇提速设置：只有免密授权已生效时才会真正下发，否则等用户手动勾选
+        FanSupervisor.shared.resume()
+        
         // 初始化剪贴板管理器
         clipboardManager = ClipboardManager()
         clipboardManager?.startMonitoring()
@@ -136,7 +139,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if settingsWindow == nil {
             settingsWindow = SettingsWindowController()
         }
-        settingsWindow?.show()
+        // 延迟到下一个 run loop：NSMenu tracking loop 仍在占用事件，直接 makeKeyAndOrderFront 可能被丢弃
+        DispatchQueue.main.async { [weak self] in
+            self?.settingsWindow?.show()
+        }
     }
     
     @objc func quit() {

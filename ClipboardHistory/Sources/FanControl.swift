@@ -1,17 +1,24 @@
 import Foundation
+import AppKit
 import IOKit
 
 /// Apple Silicon 风扇控制（通过 IOKit 用户态接口读写 AppleSMC，无需 kext）。
 ///
-/// 原理（Apple Silicon M1/M2/M3）：
+/// 原理（Apple Silicon M1~M5）：
 /// - `FNum`   风扇数量（ui8，只读）
-/// - `F%dMd`  风扇模式（ui8，读写）：0x00=自动，0x01=强制
-/// - `F%dTg`  目标转速 RPM（fpe2 或 flt，读写）：写最大值即满速
-/// - `F%dMx`  最高转速（只读），`F%dAc` 当前转速（只读），`F%dID` 风扇名称
+/// - `F%dMd`  风扇模式（ui8，读写）：0=自动，1=手动（转速由 F%dTg 决定），3=系统接管。
+///            注意 key 大小写随代际变化：M1~M4 是 `F%dMd`，M5 是 `F%dmd`，必须运行时探测。
+/// - `F%dTg`  目标转速 RPM（Apple Silicon 为 flt 小端；Intel 为 fpe2 大端，读写）
+/// - `F%dMx`  建议最高转速（只读），`F%dAc` 当前转速（只读）
+/// - `Ftst`   诊断标志（ui8，M5 上不存在）：置 1 可抑制 thermalmonitord 的回收逻辑，
+///            是 M3/M4 上「写模式被固件拒绝（0x82）」时进入手动模式的已知途径。
 ///
 /// 权限：读取无需权限；写入必须 root。App 勾选复选框时通过 osascript
 /// `with administrator privileges`（系统授权弹窗，支持 Touch ID）以 root 身份
 /// 重新调用自身 `--fanctl` 子命令完成写入。
+///
+/// 维持：thermalmonitord 每 4s（高负载 250ms）轮询并回收风扇控制权，一次性子进程
+/// 写完即退出后模式会被回收回 3，因此 App 侧由 `FanSupervisor` 按期望状态巡检补发。
 enum FanControl {
 
     // MARK: - 错误
@@ -209,11 +216,47 @@ enum FanControl {
         return (try? readNumber(conn, "F\(fan)Ac")).map { Int($0) }
     }
 
-    /// 当前是否强制模式；读取失败（部分机型无 F%dMd）返回 nil
+    /// 运行时探测当前机型可用的风扇模式 key（大小写随代际变化：M1/M4 大写 F%dMd，M5 小写 F%dmd）。
+    /// 优先尝试小写 key，失败则回退大写。若都读不到返回 nil。
+    private static func modeKey(_ fan: Int, conn: io_connect_t) -> (key: String, value: Double)? {
+        for fmt in ["F%dmd", "F%dMd"] {
+            let key = String(format: fmt, fan)
+            if let v = try? readNumber(conn, key) { return (key, v) }
+        }
+        return nil
+    }
+
+    /// 当前是否用户强制模式。
+    /// Mode 0 = Auto, 1 = Manual, 2 = Legacy forced, 3 = System (thermalmonitord 接管)。
+    /// 仅 Mode 1/2 视为真正的"用户强制"；Mode 3 表示系统在控制，不应打勾。
     static func isForced(_ fan: Int) -> Bool? {
         guard let conn = try? openConnection() else { return nil }
         defer { IOServiceClose(conn) }
-        return (try? readNumber(conn, "F\(fan)Md")).map { $0 != 0 }
+        guard let (_, mode) = modeKey(fan, conn: conn) else { return nil }
+        // 1 = Manual, 2 = Legacy forced。Mode 3 = System 不算用户强制。
+        return mode == 1 || mode == 2
+    }
+
+    /// 模式位原始值，仅用于诊断输出（0=自动 1=手动 2=T2 强制 3=系统接管）
+    static func modeRaw(_ fan: Int) -> Int? {
+        guard let conn = try? openConnection() else { return nil }
+        defer { IOServiceClose(conn) }
+        return modeKey(fan, conn: conn).map { Int($0.value) }
+    }
+
+    // MARK: - 目标转速策略
+
+    /// 勾选后的目标转速 = 建议最高转速 × 该比例。
+    /// 不用满速：噪音/功耗随转速更高阶增长，80% 已能换到大部分散热能力。
+    static let boostRatio: Double = 0.8
+
+    /// 勾选状态的 UserDefaults 键（UI、巡检器共用）
+    static func enabledKey(_ fan: Int) -> String { "fanForceEnabled_\(fan)" }
+
+    /// 勾选后该风扇的目标转速（最高转速的 80%）
+    static func targetRPM(_ fan: Int) -> Int? {
+        guard let max = maxRPM(fan), max > 0 else { return nil }
+        return Int((Double(max) * boostRatio).rounded())
     }
 
     static func fanName(_ fan: Int) -> String? {
@@ -225,42 +268,107 @@ enum FanControl {
 
     // MARK: - 风扇写入（需 root，经 --fanctl CLI 调用）
 
-    /// 设置满速 / 恢复自动。仅应在 root 进程（--fanctl 子命令）中调用。
-    static func setFullSpeed(_ fan: Int, enabled: Bool) throws {
+    private static let ftstKey = "Ftst"
+
+    private static func ftstExists(_ conn: io_connect_t) -> Bool {
+        (try? readNumber(conn, ftstKey)) != nil
+    }
+
+    private static func ftstIsSet(_ conn: io_connect_t) -> Bool {
+        ((try? readNumber(conn, ftstKey)) ?? 0) != 0
+    }
+
+    /// 是否还有任一风扇处于用户手动模式（1=手动，2=T2 强制）
+    private static func anyFanForced(_ conn: io_connect_t, count: Int) -> Bool {
+        for i in 0..<count {
+            if let (_, mode) = modeKey(i, conn: conn), mode == 1 || mode == 2 { return true }
+        }
+        return false
+    }
+
+    /// 进入手动模式：先直写 1（M1/M5 可行）；被固件拒绝（0x82：M3/M4 在 Mode 3 下的表现）
+    /// 时走 Ftst 诊断解锁——置 Ftst=1 抑制 thermalmonitord 的回收，等模式脱离 3 后重试写 1。
+    private static func enterManualMode(_ conn: io_connect_t, fan: Int, mdKey: String) throws {
+        do {
+            try writeKey(conn, mdKey, [0x01])
+            return
+        } catch let directError as FanError {
+            // 只有固件明确拒绝（0x82：Mode 3 下写模式位的典型错误）才值得走 Ftst 解锁；
+            // 权限不足等其它错误立即上抛，避免白等 10 秒解锁窗口。
+            if case .keyFailed(_, 0x82) = directError {
+                guard ftstExists(conn) else { throw directError }
+            } else {
+                throw directError
+            }
+        }
+
+        try? writeKey(conn, ftstKey, [0x01])
+        let deadline = Date().addingTimeInterval(10)
+        while Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.4)
+            // 必须等模式脱离 3（系统接管）后再写 1，早于此时写仍会被固件拒绝
+            if let mode = try? readNumber(conn, mdKey), mode != 3,
+               (try? writeKey(conn, mdKey, [0x01])) != nil {
+                return
+            }
+        }
+        throw FanError.shellFailed("无法进入手动模式：系统热管理（thermalmonitord）未交出风扇控制权")
+    }
+
+    /// 把某个风扇设为手动并指定目标转速（RPM）。仅应在 root 进程（--fanctl 子命令）中调用。
+    static func setTargetRPM(_ fan: Int, rpm: Double) throws {
         let conn = try openConnection()
         defer { IOServiceClose(conn) }
 
         let count = Int(try readNumber(conn, "FNum"))
         guard fan >= 0 && fan < count else { throw FanError.badFanIndex }
+        // 运行时探测可用模式 key（大小写随代际变化）
+        guard let (mdKey, _) = modeKey(fan, conn: conn) else {
+            throw FanError.keyFailed("F\(fan)Md", 0x84)
+        }
+        let maxRPMValue = try readNumber(conn, "F\(fan)Mx")
+        guard maxRPMValue > 0 else { throw FanError.noMaxRPM }
+        // 钳制在 [0, 建议最高转速]：Mn/Mx 只是建议区间，超出后固件可能直接拒写
+        let target = Swift.max(0, Swift.min(rpm, maxRPMValue))
 
-        if enabled {
-            let max = try readNumber(conn, "F\(fan)Mx")
-            guard max > 0 else { throw FanError.noMaxRPM }
-            // Apple Silicon 方式：强制模式 + 目标转速=最大值
-            if (try? writeKey(conn, "F\(fan)Md", [0x01])) != nil {
-                let (tgType, _) = try readKey(conn, "F\(fan)Tg")
-                guard let encoded = encodeNumber(max, type: tgType) else {
-                    throw FanError.shellFailed("F\(fan)Tg 数据类型 \(fourCCString(tgType)) 无法编码")
-                }
-                try writeKey(conn, "F\(fan)Tg", encoded)
-            } else {
-                // 回退（个别机型无 F%dMd）：写最低转速为最大值
-                // ponytail: 回退路径未经真机验证（本机 M1 Pro 支持 F%dMd），仅在无 Md key 的机型兜底
-                let (mnType, _) = try readKey(conn, "F\(fan)Mn")
-                guard let encoded = encodeNumber(max, type: mnType) else {
-                    throw FanError.shellFailed("F\(fan)Mn 数据类型无法编码")
-                }
-                try writeKey(conn, "F\(fan)Mn", encoded)
+        try enterManualMode(conn, fan: fan, mdKey: mdKey)
+
+        let (tgType, _) = try readKey(conn, "F\(fan)Tg")
+        guard let encoded = encodeNumber(target, type: tgType) else {
+            throw FanError.shellFailed("F\(fan)Tg 数据类型 \(fourCCString(tgType)) 无法编码")
+        }
+        try writeKey(conn, "F\(fan)Tg", encoded)
+
+        // Ftst 解锁会全局抑制系统热伺服，此时未勾选的风扇不会随温度升速，
+        // 必须一并给它们安全目标（同样 80%），否则存在过热风险。
+        guard ftstIsSet(conn) else { return }
+        for i in 0..<count where i != fan {
+            guard let otherMax = try? readNumber(conn, "F\(i)Mx"), otherMax > 0 else { continue }
+            guard let (otherKey, _) = modeKey(i, conn: conn) else { continue }
+            guard (try? writeKey(conn, otherKey, [0x01])) != nil else { continue }
+            if let (otherType, _) = try? readKey(conn, "F\(i)Tg"),
+               let enc = encodeNumber(otherMax * boostRatio, type: otherType) {
+                _ = try? writeKey(conn, "F\(i)Tg", enc)
             }
-        } else {
-            if (try? writeKey(conn, "F\(fan)Md", [0x00])) != nil {
-                // 恢复自动即可，目标转速由系统接管
-            } else {
-                let (mnType, _) = try readKey(conn, "F\(fan)Mn")
-                if let encoded = encodeNumber(0, type: mnType) {
-                    try writeKey(conn, "F\(fan)Mn", encoded)
-                }
-            }
+        }
+    }
+
+    /// 恢复系统自动控制。仅应在 root 进程（--fanctl 子命令）中调用。
+    static func setAuto(_ fan: Int) throws {
+        let conn = try openConnection()
+        defer { IOServiceClose(conn) }
+
+        let count = Int(try readNumber(conn, "FNum"))
+        guard fan >= 0 && fan < count else { throw FanError.badFanIndex }
+        guard let (mdKey, _) = modeKey(fan, conn: conn) else {
+            throw FanError.keyFailed("F\(fan)Md", 0x84)
+        }
+        try writeKey(conn, mdKey, [0x00])
+
+        // 只有「所有风扇都回到自动」才复位 Ftst：仍有风扇处于手动时复位，
+        // 系统会把控制权连同剩余勾选一起收回。
+        if ftstIsSet(conn) && !anyFanForced(conn, count: count) {
+            _ = try? writeKey(conn, ftstKey, [0x00])
         }
     }
 
@@ -280,13 +388,7 @@ enum FanControl {
         guard sudoersNeedsInstall else { return }
 
         // 前置探针：UserDefaults 无记录但 sudo -n 实际已生效（上次安装遗留的规则）
-        let probe = Process()
-        probe.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
-        probe.arguments = ["-n", binPath, "--fanctl", "info"]
-        probe.standardOutput = Pipe(); probe.standardError = Pipe()
-        try? probe.run()
-        probe.waitUntilExit()
-        if probe.terminationStatus == 0 {
+        if probeSudoSilent(binPath) {
             UserDefaults.standard.set(binPath, forKey: installedKey)
             return
         }
@@ -294,7 +396,10 @@ enum FanControl {
         // 确实需要安装：一次性 osascript 授权弹窗
         let rule = "%admin ALL=(ALL) NOPASSWD: \(binPath) --fanctl *\n"
 
-        let tmpFile = "/tmp/clipboardhistory.sudoers.tmp"
+        // 固定路径的临时文件可被预先占坑（DoS）或在竞态窗口被替换，改用 0700 随机目录
+        let tmpDir = try makePrivateTempDirectory()
+        defer { try? FileManager.default.removeItem(atPath: tmpDir) }
+        let tmpFile = (tmpDir as NSString).appendingPathComponent("sudoers")
         try rule.write(toFile: tmpFile, atomically: true, encoding: .utf8)
 
         let cp = "cp \(shellQuote(tmpFile)) \(sudoersFile) && chmod 0440 \(sudoersFile)"
@@ -309,8 +414,6 @@ enum FanControl {
         try osa.run()
         osa.waitUntilExit()
 
-        try? FileManager.default.removeItem(atPath: tmpFile)
-
         if osa.terminationStatus != 0 {
             let err = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
             if err.localizedCaseInsensitiveContains("canceled") { throw FanError.cancelled }
@@ -321,44 +424,74 @@ enum FanControl {
         UserDefaults.standard.set(binPath, forKey: installedKey)
     }
 
-    static func applyFullSpeed(_ fan: Int, enabled: Bool, completion: @escaping (Result<Void, FanError>) -> Void) {
+    /// 当前二进制是否已可免密提权（不触发任何弹窗），供巡检器判断是否值得自动补发
+    static func canRunPrivilegedSilently() -> Bool {
+        let binPath = Bundle.main.executableURL?.path ?? ProcessInfo.processInfo.arguments[0]
+        guard UserDefaults.standard.string(forKey: installedKey) == binPath else { return false }
+        return probeSudoSilent(binPath)
+    }
+
+    /// `sudo -n <bin> --fanctl info` 是否成功。进程未启动成功时 terminationStatus 仍是 0，
+    /// 必须显式区分「启动失败」与「退出码 0」。
+    private static func probeSudoSilent(_ binPath: String) -> Bool {
+        let probe = Process()
+        probe.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
+        probe.arguments = ["-n", binPath, "--fanctl", "info"]
+        probe.standardOutput = Pipe(); probe.standardError = Pipe()
+        do { try probe.run() } catch { return false }
+        probe.waitUntilExit()
+        return probe.terminationStatus == 0
+    }
+
+    /// 下发 / 取消某个风扇的提速；勾选后目标 = 最高转速的 80%（不是满速）。
+    /// - parameter allowSudoersInstall: 巡检器自动补发传 false，避免在后台弹出授权窗口。
+    static func apply(_ fan: Int, boost enabled: Bool,
+                     allowSudoersInstall: Bool = true,
+                     completion: @escaping (Result<Void, FanError>) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
-            let subArgs: String
+            let args: [String]
             if enabled {
-                guard let rpm = maxRPM(fan) else {
+                guard let rpm = targetRPM(fan) else {
                     DispatchQueue.main.async { completion(.failure(.noMaxRPM)) }
                     return
                 }
-                subArgs = "set \(fan) \(rpm)"
+                args = ["set", String(fan), String(rpm)]
             } else {
-                subArgs = "auto \(fan)"
+                args = ["auto", String(fan)]
             }
 
             do {
-                try ensureSudoersInstalled()
-
-                let binPath = Bundle.main.executableURL?.path ?? ProcessInfo.processInfo.arguments[0]
-                let process = Process()
-                process.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
-                process.arguments = ["-n", binPath, "--fanctl"] + subArgs.split(separator: " ").map(String.init)
-                let errPipe = Pipe()
-                process.standardError = errPipe
-                process.standardOutput = Pipe()
-                try process.run()
-                process.waitUntilExit()
-
-                if process.terminationStatus == 0 {
-                    DispatchQueue.main.async { completion(.success(())) }
-                } else {
-                    let errText = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-                    let msg = errText.isEmpty ? "风扇操作失败 (exit=\(process.terminationStatus))" : errText.trimmingCharacters(in: .whitespacesAndNewlines)
-                    DispatchQueue.main.async { completion(.failure(.shellFailed(msg))) }
+                if allowSudoersInstall {
+                    try ensureSudoersInstalled()
+                } else if !canRunPrivilegedSilently() {
+                    throw FanError.shellFailed("免密授权尚未生效，请手动勾选一次以完成授权")
                 }
+                try runPrivileged(args)
+                DispatchQueue.main.async { completion(.success(())) }
             } catch let e as FanError {
                 DispatchQueue.main.async { completion(.failure(e)) }
             } catch {
                 DispatchQueue.main.async { completion(.failure(.shellFailed(error.localizedDescription))) }
             }
+        }
+    }
+
+    /// 以 root 执行 `--fanctl <args>`；非 0 退出码转成 FanError.shellFailed
+    private static func runPrivileged(_ args: [String]) throws {
+        let binPath = Bundle.main.executableURL?.path ?? ProcessInfo.processInfo.arguments[0]
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
+        process.arguments = ["-n", binPath, "--fanctl"] + args
+        let errPipe = Pipe()
+        process.standardError = errPipe
+        process.standardOutput = Pipe()
+        try process.run()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            let errText = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            let msg = errText.isEmpty ? "风扇操作失败 (exit=\(process.terminationStatus))"
+                                      : errText.trimmingCharacters(in: .whitespacesAndNewlines)
+            throw FanError.shellFailed(msg)
         }
     }
 
@@ -368,11 +501,21 @@ enum FanControl {
         "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
+    /// 0700 私有临时目录：避开 /tmp 固定文件名带来的占坑与竞态风险
+    private static func makePrivateTempDirectory() throws -> String {
+        let base = (NSTemporaryDirectory() as NSString).appendingPathComponent("clipboardhistory.sudoers.XXXXXX")
+        var template = [Int8](base.utf8CString)
+        guard mkdtemp(&template) != nil else {
+            throw FanError.shellFailed("无法创建临时目录")
+        }
+        return String(cString: template)
+    }
+
     // MARK: - CLI 入口（--fanctl，供提权子进程与调试使用）
 
     /// 用法：
     ///   --fanctl info            打印风扇信息（无需权限）
-    ///   --fanctl set <fan> <rpm> 强制风扇满速/指定转速（需 root）
+    ///   --fanctl set <fan> <rpm> 设为手动模式并指定目标转速（需 root）
     ///   --fanctl auto <fan>      恢复系统自动控制（需 root）
     static func runCLI(_ args: [String]) -> Int32 {
         guard MemoryLayout<SMCKeyData>.stride == 80 else {
@@ -386,11 +529,11 @@ enum FanControl {
             let count = fanCount()
             print("风扇数量: \(count)")
             for i in 0..<count {
-                let name = fanName(i) ?? "?"
                 let max = maxRPM(i).map { "\($0)" } ?? "?"
                 let cur = actualRPM(i).map { "\($0)" } ?? "?"
-                let mode = isForced(i).map { $0 ? "强制" : "自动" } ?? "未知"
-                print("风扇 \(i) [\(name)]: 当前 \(cur) RPM / 最大 \(max) RPM / 模式: \(mode)")
+                let target = targetRPM(i).map { "\($0)" } ?? "?"
+                let mode = modeRaw(i).map { "\($0)" } ?? "未知"
+                print("风扇 \(i): 当前 \(cur) RPM / 最大 \(max) RPM / 80% 目标 \(target) RPM / 模式 \(mode)")
             }
             return 0
 
@@ -400,8 +543,9 @@ enum FanControl {
                 return 1
             }
             do {
-                try setFullSpeed(fan, enabled: true)
-                print("风扇 \(fan) 已强制满速（目标 \(Int(rpm)) RPM）")
+                // 目标转速由上层算好传入（App 侧是最高转速的 80%），此处不再自行取最大值
+                try setTargetRPM(fan, rpm: rpm)
+                print("风扇 \(fan) 已设为手动，目标 \(Int(rpm)) RPM")
                 return 0
             } catch {
                 FileHandle.standardError.write(Data("设置失败: \(error.localizedDescription)\n".utf8))
@@ -414,7 +558,7 @@ enum FanControl {
                 return 1
             }
             do {
-                try setFullSpeed(fan, enabled: false)
+                try setAuto(fan)
                 print("风扇 \(fan) 已恢复系统自动控制")
                 return 0
             } catch {
@@ -427,4 +571,109 @@ enum FanControl {
             return 1
         }
     }
+}
+
+// MARK: - 手动模式保持（App 侧）
+
+/// thermalmonitord 每 4s（高负载 250ms）轮询并回收风扇控制权：一次性 sudo 子进程
+/// 写完就退出，模式很快被回收回 3，表现为「勾上了没多久又自己弹回」。
+///
+/// 巡检器只做两件事：
+/// 1. 每 5s 只读一次模式位（读 SMC 无需 root，开销极小）；
+/// 2. 仅当某个「期望手动」的风扇已被回收时，才重新走一次提权下发。
+/// 这样既能把控制权持续夺回，又不会无谓地反复调 sudo。
+final class FanSupervisor {
+
+    static let shared = FanSupervisor()
+
+    /// 期望处于手动（80%）状态的风扇序号
+    private(set) var boosted: Set<Int> = []
+    private var timer: Timer?
+    private var busy = false
+    private var observers: [NSObjectProtocol] = []
+
+    private init() {
+        let count = FanControl.fanCount()
+        boosted = Set((0..<count).filter { UserDefaults.standard.bool(forKey: FanControl.enabledKey($0)) })
+
+        let nc = NSWorkspace.shared.notificationCenter
+        // 睡眠会重置 Ftst 与手动模式，唤醒后必须补发
+        observers.append(nc.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.start()
+            self?.refresh()
+        })
+        observers.append(nc.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.stop()
+        })
+    }
+
+    deinit {
+        let nc = NSWorkspace.shared.notificationCenter
+        observers.forEach(nc.removeObserver)
+    }
+
+    /// 记录用户意图：写 UserDefaults，并启/停巡检
+    func setBoosted(_ fan: Int, _ on: Bool) {
+        if on { boosted.insert(fan) } else { boosted.remove(fan) }
+        UserDefaults.standard.set(on, forKey: FanControl.enabledKey(fan))
+        if boosted.isEmpty {
+            stop()
+        } else {
+            start()
+            refresh()
+        }
+    }
+
+    /// App 启动 / 唤醒后恢复上次勾选（只有免密授权已生效时才真正下发）
+    func resume() {
+        guard !boosted.isEmpty else { return }
+        start()
+        refresh()
+    }
+
+    private func start() {
+        guard timer == nil else { return }
+        let t = Timer(timeInterval: 5, repeats: true) { [weak self] _ in self?.refresh() }
+        t.tolerance = 1
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+    }
+
+    private func stop() {
+        timer?.invalidate()
+        timer = nil
+    }
+
+    private func refresh() {
+        guard !boosted.isEmpty, !busy else { return }
+        // isForced 为 nil 表示 SMC 读取失败，此时不要补发，避免刷屏
+        let lost = boosted.filter { !(FanControl.isForced($0) ?? true) }
+        guard !lost.isEmpty else { return }
+        // 尚未授权时静默跳过：等用户手动勾选走一次授权流程即可
+        guard FanControl.canRunPrivilegedSilently() else { return }
+        busy = true
+        applyNext(Array(lost))
+    }
+
+    private func applyNext(_ queue: [Int]) {
+        guard let fan = queue.first else {
+            busy = false
+            return
+        }
+        FanControl.apply(fan, boost: true, allowSudoersInstall: false) { [weak self] result in
+            guard let self else { return }
+            if case .failure = result {
+                // 免密授权失效（App 被移动/重装等）：放弃该风扇的期望状态，避免后台反复失败
+                self.boosted.remove(fan)
+                UserDefaults.standard.set(false, forKey: FanControl.enabledKey(fan))
+                NotificationCenter.default.post(name: .fanStateDidChange, object: nil)
+            }
+            self.applyNext(Array(queue.dropFirst()))
+        }
+    }
+}
+
+extension Notification.Name {
+    /// 风扇状态被后台巡检器改变（补发成功/放弃），UI 需要重新同步
+    static let fanStateDidChange = Notification.Name("fanStateDidChange")
 }
