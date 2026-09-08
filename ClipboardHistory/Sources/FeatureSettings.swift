@@ -11,6 +11,9 @@ enum FeatureSettings {
     /// 是否启用：⌃V 触发系统剪贴板（⌘Space → 延迟 → ⌘4）
     static let enableControlVSystemClipboardKey = "enableControlVSystemClipboard"
     
+    /// 是否启用：合盖 / 系统睡眠时自动把风扇交还系统控制（避免风扇在合盖后持续高速）
+    static let fanReleaseWhenClosedKey = "fanReleaseWhenClosed"
+
     /// 旧版迁移标记
     private static let migrationKey = "hasMigratedFeatureSettingsV2"
     
@@ -34,6 +37,20 @@ enum FeatureSettings {
     static func setEnableControlVSystemClipboard(_ enabled: Bool) {
         UserDefaults.standard.set(enabled, forKey: enableControlVSystemClipboardKey)
         NotificationCenter.default.post(name: .featureSettingsDidChange, object: nil)
+    }
+
+    // MARK: - 风扇开关 Setter
+
+    /// 未设置过（object == nil）时默认开启，避免依赖 register(defaults:) 的执行顺序
+    static var fanReleaseWhenClosed: Bool {
+        UserDefaults.standard.object(forKey: fanReleaseWhenClosedKey) == nil
+            ? true
+            : UserDefaults.standard.bool(forKey: fanReleaseWhenClosedKey)
+    }
+
+    static func setFanReleaseWhenClosed(_ enabled: Bool) {
+        UserDefaults.standard.set(enabled, forKey: fanReleaseWhenClosedKey)
+        FanSupervisor.shared.releaseSettingDidChange()
     }
     
     // MARK: - 开机启动 (SMAppService)
@@ -81,6 +98,7 @@ enum FeatureSettings {
     static func resetToDefaults() {
         setEnableOptionVAppClipboard(true)
         setEnableControlVSystemClipboard(false)
+        setFanReleaseWhenClosed(true)
         // 注意：不重置 launchAtLogin，因为它是系统级设置
     }
 }

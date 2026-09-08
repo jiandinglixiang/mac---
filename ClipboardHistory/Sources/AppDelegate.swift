@@ -29,7 +29,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             AppearanceSettings.cardBackgroundAlphaKey: 0.85,
             // 功能开关默认值
             FeatureSettings.enableOptionVAppClipboardKey: true,
-            FeatureSettings.enableControlVSystemClipboardKey: false
+            FeatureSettings.enableControlVSystemClipboardKey: false,
+            FeatureSettings.fanReleaseWhenClosedKey: true
         ])
 
         // 监听前台应用切换，记录“最后一个非本应用”的前台应用

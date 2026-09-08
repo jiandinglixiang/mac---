@@ -266,6 +266,30 @@ enum FanControl {
         return String(bytes: bytes.prefix { $0 != 0 }, encoding: .utf8)
     }
 
+    // MARK: - 盖子（Clamshell）状态
+
+    private static let lidKey = "MSLD"
+
+    /// 盖子是否合上；`nil` = 本机无法判定（台式机，或两个来源都不可用）。
+    ///
+    /// 优先读电源管理维护的 `AppleClamshellState`（IOPMrootDomain，合盖瞬间即翻转，
+    /// 比等系统睡眠通知更早，能覆盖「外接显示器的合盖模式：机器不睡但盖子合着」）；
+    /// 读不到时回退 SMC 的 `MSLD`。两种来源都是只读，开销与一次 SMC 读相当。
+    static func isLidClosed() -> Bool? {
+        let root = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPMrootDomain"))
+        if root != 0 {
+            defer { IOObjectRelease(root) }
+            if let obj = IORegistryEntryCreateCFProperty(root, "AppleClamshellState" as CFString,
+                                                         kCFAllocatorDefault, 0)?.takeRetainedValue() {
+                if let number = obj as? NSNumber { return number.boolValue }
+                if let bool = obj as? Bool { return bool }
+            }
+        }
+        guard let conn = try? openConnection() else { return nil }
+        defer { IOServiceClose(conn) }
+        return (try? readNumber(conn, lidKey)).map { $0 != 0 }
+    }
+
     // MARK: - 风扇写入（需 root，经 --fanctl CLI 调用）
 
     private static let ftstKey = "Ftst"
@@ -476,6 +500,44 @@ enum FanControl {
         }
     }
 
+    // MARK: - 交还控制权（合盖 / 系统睡眠前）
+
+    /// 所有释放命令串在此队列，避免与巡检补发互相覆盖（一边写 1 一边写 0）
+    private static let releaseQueue = DispatchQueue(label: "com.clipboard.history.fan.release")
+
+    /// 逐个把风扇交还系统自动控制；同步实现，只能在 releaseQueue 上调用
+    private static func performRelease(_ fans: [Int]) -> Bool {
+        guard canRunPrivilegedSilently() else { return false }
+        var ok = true
+        for fan in fans {
+            do { try runPrivileged(["auto", String(fan)]) } catch { ok = false }
+        }
+        return ok
+    }
+
+    /// 阻塞式交还控制权：在调用线程最多等 `timeout` 秒。
+    /// 只用于「必须赶在系统睡眠前完成」的场景（willSleep 通知）——睡眠不会带走 SMC 的
+    /// 手动模式，不交还的话风扇会按手动目标转速一直转到唤醒。
+    @discardableResult
+    static func releaseAllAndWait(_ fans: [Int], timeout: TimeInterval = 5) -> Bool {
+        guard !fans.isEmpty else { return true }
+        let done = Flag()
+        let sem = DispatchSemaphore(value: 0)
+        releaseQueue.async {
+            _ = performRelease(fans)
+            done.value = true
+            sem.signal()
+        }
+        _ = sem.wait(timeout: .now() + timeout)
+        return done.value
+    }
+
+    /// 异步交还控制权（巡检发现合盖时用，不阻塞主线程）
+    static func releaseAll(_ fans: [Int]) {
+        guard !fans.isEmpty else { return }
+        releaseQueue.async { _ = performRelease(fans) }
+    }
+
     /// 以 root 执行 `--fanctl <args>`；非 0 退出码转成 FanError.shellFailed
     private static func runPrivileged(_ args: [String]) throws {
         let binPath = Bundle.main.executableURL?.path ?? ProcessInfo.processInfo.arguments[0]
@@ -497,6 +559,12 @@ enum FanControl {
 
     // MARK: - 辅助
 
+    /// 跨线程传递布尔结果的容器（避免在逃逸闭包里读写局部 var）
+    private final class Flag {
+        var value: Bool
+        init(_ value: Bool = false) { self.value = value }
+    }
+
     private static func shellQuote(_ s: String) -> String {
         "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
@@ -515,6 +583,7 @@ enum FanControl {
 
     /// 用法：
     ///   --fanctl info            打印风扇信息（无需权限）
+    ///   --fanctl lid             打印盖子（合盖）状态（无需权限）
     ///   --fanctl set <fan> <rpm> 设为手动模式并指定目标转速（需 root）
     ///   --fanctl auto <fan>      恢复系统自动控制（需 root）
     static func runCLI(_ args: [String]) -> Int32 {
@@ -534,6 +603,14 @@ enum FanControl {
                 let target = targetRPM(i).map { "\($0)" } ?? "?"
                 let mode = modeRaw(i).map { "\($0)" } ?? "未知"
                 print("风扇 \(i): 当前 \(cur) RPM / 最大 \(max) RPM / 80% 目标 \(target) RPM / 模式 \(mode)")
+            }
+            return 0
+
+        case "lid":
+            switch isLidClosed() {
+            case .some(true):  print("盖子: 已合上")
+            case .some(false): print("盖子: 打开")
+            case nil:          print("盖子: 无法判定（台式机或本机无该传感器）")
             }
             return 0
 
@@ -567,7 +644,7 @@ enum FanControl {
             }
 
         default:
-            FileHandle.standardError.write(Data("用法: --fanctl info | set <fan> <rpm> | auto <fan>\n".utf8))
+            FileHandle.standardError.write(Data("用法: --fanctl info | lid | set <fan> <rpm> | auto <fan>\n".utf8))
             return 1
         }
     }
@@ -586,8 +663,14 @@ final class FanSupervisor {
 
     static let shared = FanSupervisor()
 
+    /// 挂起（已交还系统控制）的原因
+    enum SuspendReason { case lid, systemSleep }
+
     /// 期望处于手动（80%）状态的风扇序号
     private(set) var boosted: Set<Int> = []
+    /// 已交还系统控制、停止补发（合盖或系统睡眠）
+    private(set) var isSuspended = false
+    private(set) var suspendReason: SuspendReason?
     private var timer: Timer?
     private var busy = false
     private var observers: [NSObjectProtocol] = []
@@ -597,13 +680,17 @@ final class FanSupervisor {
         boosted = Set((0..<count).filter { UserDefaults.standard.bool(forKey: FanControl.enabledKey($0)) })
 
         let nc = NSWorkspace.shared.notificationCenter
+        // 系统睡眠：SMC 的手动模式不会随睡眠消失，不交还的话风扇会按 80% 目标一路转到唤醒，
+        // 因此这里必须同步（阻塞最多 5s）等释放命令下发完，比定时器轮询可靠。
+        observers.append(nc.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.suspend(reason: .systemSleep, wait: true)
+        })
         // 睡眠会重置 Ftst 与手动模式，唤醒后必须补发
         observers.append(nc.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
             self?.start()
-            self?.refresh()
-        })
-        observers.append(nc.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
-            self?.stop()
+            self?.isSuspended = false
+            self?.suspendReason = nil
+            self?.refresh()   // 若盖子仍合着（合盖唤醒），refresh 会继续保持挂起
         })
     }
 
@@ -614,7 +701,14 @@ final class FanSupervisor {
 
     /// 记录用户意图：写 UserDefaults，并启/停巡检
     func setBoosted(_ fan: Int, _ on: Bool) {
-        if on { boosted.insert(fan) } else { boosted.remove(fan) }
+        if on {
+            boosted.insert(fan)
+            // 用户主动勾选 = 现在就要提速，清掉合盖/睡眠挂起
+            isSuspended = false
+            suspendReason = nil
+        } else {
+            boosted.remove(fan)
+        }
         UserDefaults.standard.set(on, forKey: FanControl.enabledKey(fan))
         if boosted.isEmpty {
             stop()
@@ -622,6 +716,55 @@ final class FanSupervisor {
             start()
             refresh()
         }
+    }
+
+    /// 「合盖/睡眠时恢复系统控制」开关被改动后重新评估（关掉开关要立刻恢复提速）
+    func releaseSettingDidChange() {
+        if !FeatureSettings.fanReleaseWhenClosed && isSuspended {
+            isSuspended = false
+            suspendReason = nil
+        }
+        refresh()
+    }
+
+    // MARK: - 挂起 / 恢复
+
+    /// 是否应保持「已交还系统控制」：开关打开且盖子合着
+    private func shouldStayReleased() -> Bool {
+        guard FeatureSettings.fanReleaseWhenClosed else { return false }
+        return FanControl.isLidClosed() == true
+    }
+
+    /// 交还控制权并停止补发。
+    /// - parameter wait: 是否阻塞当前线程等待下发完成（系统睡眠前必须等，合盖轮询则不需要）
+    private func suspend(reason: SuspendReason, wait: Bool) {
+        guard FeatureSettings.fanReleaseWhenClosed else { return }
+        // 已挂起时只有「需要等待」的场景（系统睡眠）才值得再发一次：合盖后的异步释放
+        // 可能还没跑完系统就睡了，setAuto 幂等，重发一次确保睡眠前已交还控制权
+        guard !isSuspended || wait else { return }
+        // 必须释放「全部」风扇而不是只释放勾选的：M3/M4 走 Ftst 解锁时
+        // setTargetRPM 会把未勾选的风扇一并设成手动 80%，只释放勾选的那些会导致
+        // 其余风扇继续手动，且 setAuto 里的 anyFanForced 检查会因此拒绝复位 Ftst。
+        let count = FanControl.fanCount()
+        let fans = count > 0 ? Array(0..<count) : Array(boosted)
+        isSuspended = true
+        suspendReason = reason
+        if wait {
+            // 阻塞主线程是有意为之：willSleep 通知处理完系统才会睡，异步补发赶不上
+            FanControl.releaseAllAndWait(fans, timeout: 5)
+        } else {
+            FanControl.releaseAll(fans)
+        }
+        NotificationCenter.default.post(name: .fanStateDidChange, object: nil)
+    }
+
+    /// 挂起期间每轮巡检判断是否已开盖，是则恢复提速
+    private func resumeIfPossible() {
+        guard isSuspended, !shouldStayReleased() else { return }
+        isSuspended = false
+        suspendReason = nil
+        refresh()
+        NotificationCenter.default.post(name: .fanStateDidChange, object: nil)
     }
 
     /// App 启动 / 唤醒后恢复上次勾选（只有免密授权已生效时才真正下发）
@@ -646,6 +789,19 @@ final class FanSupervisor {
 
     private func refresh() {
         guard !boosted.isEmpty, !busy else { return }
+        if isSuspended {
+            // 并发竞态自愈：挂起瞬间若有补发命令仍在飞，可能把某个风扇又写成手动；
+            // 这里再检查并释放一次（幂等），确保合盖后不留任何手动风扇
+            let stillForced = Array(boosted).filter { FanControl.isForced($0) == true }
+            if !stillForced.isEmpty { FanControl.releaseAll(stillForced) }
+            resumeIfPossible()
+            return
+        }
+        // 合盖但机器没睡（外接显示器的合盖模式）：交还控制权，不再与 thermalmonitord 抢
+        if shouldStayReleased() {
+            suspend(reason: .lid, wait: false)
+            return
+        }
         // isForced 为 nil 表示 SMC 读取失败，此时不要补发，避免刷屏
         let lost = boosted.filter { !(FanControl.isForced($0) ?? true) }
         guard !lost.isEmpty else { return }
@@ -660,6 +816,8 @@ final class FanSupervisor {
             busy = false
             return
         }
+        // 补发途中被挂起（系统睡眠/合盖）：立刻停手，否则会和释放命令互相打架
+        guard !isSuspended else { busy = false; return }
         FanControl.apply(fan, boost: true, allowSudoersInstall: false) { [weak self] result in
             guard let self else { return }
             if case .failure = result {

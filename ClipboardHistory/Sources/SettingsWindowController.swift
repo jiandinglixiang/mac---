@@ -29,12 +29,14 @@ final class SettingsWindowController: NSWindowController {
     private var fanCheckboxes: [NSButton] = []   // tag = 风扇序号（0=左，1=右）
     private var fanStateObserver: NSObjectProtocol?
     private let fanStatusLabel = NSTextField(labelWithString: "")
+    private let fanReleaseCheckbox = NSButton(checkboxWithTitle: "合盖 / 睡眠时恢复系统控制", target: nil, action: nil)
+    private let fanReleaseHintLabel = NSTextField(labelWithString: "合盖或系统睡眠前把风扇交还系统，避免风扇在合盖后一直高速转动；开盖/唤醒后自动恢复提速")
     private let fanHintLabel = NSTextField(labelWithString: "勾选后目标转速为最高转速的 80%（非满速，兼顾散热与噪音）；首次勾选需管理员授权（Touch ID/密码），被系统回收时会自动补发")
 
     // MARK: - 初始化
 
     init() {
-        let height: CGFloat = fanCount > 0 ? 500 : 400
+        let height: CGFloat = fanCount > 0 ? 560 : 400
         let panel = NSPanel(
             contentRect: NSRect(x: 0, y: 0, width: 420, height: height),
             styleMask: [.titled, .closable],
@@ -131,6 +133,16 @@ final class SettingsWindowController: NSWindowController {
         fanStatusLabel.textColor = .secondaryLabelColor
         fanHintLabel.font = .systemFont(ofSize: 11, weight: .regular)
         fanHintLabel.textColor = .secondaryLabelColor
+        fanReleaseCheckbox.target = self
+        fanReleaseCheckbox.action = #selector(onFanReleaseChanged(_:))
+        fanReleaseHintLabel.font = .systemFont(ofSize: 11, weight: .regular)
+        fanReleaseHintLabel.textColor = .secondaryLabelColor
+        fanReleaseHintLabel.maximumNumberOfLines = 2
+        fanReleaseHintLabel.preferredMaxLayoutWidth = 360
+        fanReleaseHintLabel.lineBreakMode = .byWordWrapping
+        fanHintLabel.maximumNumberOfLines = 3
+        fanHintLabel.preferredMaxLayoutWidth = 360
+        fanHintLabel.lineBreakMode = .byWordWrapping
 
         // 外观滑块行
         let historyRow = labeledSliderRow(
@@ -187,7 +199,8 @@ final class SettingsWindowController: NSWindowController {
                 fanCheckboxes.append(cb)
             }
 
-            let fanStack = NSStackView(views: fanCheckboxes + [fanStatusLabel, fanHintLabel])
+            let fanStack = NSStackView(views: fanCheckboxes + [fanStatusLabel, fanHintLabel,
+                                                               fanReleaseCheckbox, fanReleaseHintLabel])
             fanStack.orientation = .vertical
             fanStack.alignment = .leading
             fanStack.spacing = 4
@@ -310,7 +323,18 @@ final class SettingsWindowController: NSWindowController {
         if !ramping.isEmpty {
             status += "（\(ramping.joined(separator: "、"))加速中）"
         }
+        // 挂起期间硬件确实已回到自动，复选框会显示为未勾选，这里说明原因避免误解
+        if FanSupervisor.shared.isSuspended {
+            let reason = FanSupervisor.shared.suspendReason == .lid ? "合盖中" : "睡眠中"
+            status += "（\(reason)，已交还系统控制）"
+        }
         fanStatusLabel.stringValue = status
+        fanReleaseCheckbox.state = FeatureSettings.fanReleaseWhenClosed ? .on : .off
+    }
+
+    @objc private func onFanReleaseChanged(_ sender: NSButton) {
+        FeatureSettings.setFanReleaseWhenClosed(sender.state == .on)
+        syncFanSection()
     }
 
     @objc private func onFanCheckboxChanged(_ sender: NSButton) {
