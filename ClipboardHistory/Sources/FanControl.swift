@@ -664,7 +664,7 @@ final class FanSupervisor {
     static let shared = FanSupervisor()
 
     /// 挂起（已交还系统控制）的原因
-    enum SuspendReason { case lid, systemSleep, displayOff, screenLocked }
+    enum SuspendReason { case lid, systemSleep, displayOff, screenLocked, screenSaver, offConsole }
 
     /// 期望处于手动（80%）状态的风扇序号
     private(set) var boosted: Set<Int> = []
@@ -678,6 +678,8 @@ final class FanSupervisor {
     /// 是否已锁屏（CGSSessionScreenIsLocked 已从 CGSessionCopyCurrentDictionary 移除，
     /// 只能靠 loginwindow 的分布式通知维护；漏通知时由 sessionDidBecomeActive 兜底）
     private var screenLocked = false
+    /// 屏保是否正在运行（系统不保证发出 didstop，亮屏通知里会一并清掉）
+    private var screenSaverActive = false
 
     /// 巡检间隔：正常 5s；挂起期间拉长到 15s，减少后台唤醒，让系统能真正睡下去
     private var pollInterval: TimeInterval { isSuspended ? 15 : 5 }
@@ -710,6 +712,8 @@ final class FanSupervisor {
             self?.suspend(reason: .displayOff, wait: false)
         })
         workspaceObservers.append(nc.addObserver(forName: NSWorkspace.screensDidWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            // 屏保/锁屏结束时屏幕一定会亮，这里顺手清掉可能漏发的 didstop 标志
+            self?.screenSaverActive = false
             self?.resumeIfPossible()
         })
         // 回到自己的会话（解锁 / 从快速用户切换切回）：兜住漏发的解锁通知
@@ -727,6 +731,18 @@ final class FanSupervisor {
             self?.screenLocked = false
             self?.resumeIfPossible()
         })
+        // 屏保运行 = 人已离开（且屏保本身耗电发热）。系统不保证发出 didstop，
+        // 因此额外监听 willstop，并在 screensDidWake 里兜底清除标志。
+        distributedObservers.append(dnc.addObserver(forName: Notification.Name("com.apple.screensaver.didstart"), object: nil, queue: .main) { [weak self] _ in
+            self?.screenSaverActive = true
+            self?.suspend(reason: .screenSaver, wait: false)
+        })
+        for stopName in ["com.apple.screensaver.didstop", "com.apple.screensaver.willstop"] {
+            distributedObservers.append(dnc.addObserver(forName: Notification.Name(stopName), object: nil, queue: .main) { [weak self] _ in
+                self?.screenSaverActive = false
+                self?.resumeIfPossible()
+            })
+        }
     }
 
     deinit {
@@ -768,18 +784,28 @@ final class FanSupervisor {
 
     // MARK: - 挂起 / 恢复
 
-    /// 是否应保持「已交还系统控制」：开关打开且（合盖 / 屏幕已黑 / 已锁屏）
+    /// 是否应保持「已交还系统控制」：开关打开且人不在这台机器前
+    /// （合盖 / 黑屏 / 锁屏 / 屏保 / 会话已切走）
     private func shouldStayReleased() -> Bool {
         guard FeatureSettings.fanReleaseWhenClosed else { return false }
         if FanControl.isLidClosed() == true { return true }
         if isDisplayAsleep() { return true }
-        if screenLocked { return true }
+        if screenLocked || screenSaverActive { return true }
+        if isSessionOffConsole() { return true }
         return false
     }
 
     /// 主显示器是否已进入节能（黑屏）
     private func isDisplayAsleep() -> Bool {
         CGDisplayIsAsleep(CGMainDisplayID()) != 0
+    }
+
+    /// 本会话是否不在控制台：覆盖快速用户切换、登录窗口、远程桌面（ARD/VNC）接管等
+    /// 锁屏通知不会发的场景。无 GUI 会话时查不到，按「在控制台」处理（不误伤）。
+    private func isSessionOffConsole() -> Bool {
+        guard let dict = CGSessionCopyCurrentDictionary() as? [String: Any] else { return false }
+        guard let onConsole = dict[kCGSessionOnConsoleKey as String] as? Bool else { return false }
+        return !onConsole
     }
 
     /// 交还控制权并停止补发。

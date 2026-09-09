@@ -330,6 +330,8 @@ final class SettingsWindowController: NSWindowController {
             case .lid:          reason = "合盖中"
             case .displayOff:   reason = "屏幕已关闭"
             case .screenLocked: reason = "已锁屏"
+            case .screenSaver:  reason = "屏保中"
+            case .offConsole:   reason = "会话已切走"
             case .systemSleep:  reason = "睡眠中"
             case .none:         reason = "已暂停"
             }
