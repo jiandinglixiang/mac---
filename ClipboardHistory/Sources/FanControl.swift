@@ -664,16 +664,23 @@ final class FanSupervisor {
     static let shared = FanSupervisor()
 
     /// 挂起（已交还系统控制）的原因
-    enum SuspendReason { case lid, systemSleep }
+    enum SuspendReason { case lid, systemSleep, displayOff, screenLocked }
 
     /// 期望处于手动（80%）状态的风扇序号
     private(set) var boosted: Set<Int> = []
-    /// 已交还系统控制、停止补发（合盖或系统睡眠）
+    /// 已交还系统控制、停止补发（合盖、黑屏、锁屏或系统睡眠）
     private(set) var isSuspended = false
     private(set) var suspendReason: SuspendReason?
     private var timer: Timer?
     private var busy = false
-    private var observers: [NSObjectProtocol] = []
+    private var workspaceObservers: [NSObjectProtocol] = []
+    private var distributedObservers: [NSObjectProtocol] = []
+    /// 是否已锁屏（CGSSessionScreenIsLocked 已从 CGSessionCopyCurrentDictionary 移除，
+    /// 只能靠 loginwindow 的分布式通知维护；漏通知时由 sessionDidBecomeActive 兜底）
+    private var screenLocked = false
+
+    /// 巡检间隔：正常 5s；挂起期间拉长到 15s，减少后台唤醒，让系统能真正睡下去
+    private var pollInterval: TimeInterval { isSuspended ? 15 : 5 }
 
     private init() {
         let count = FanControl.fanCount()
@@ -682,30 +689,61 @@ final class FanSupervisor {
         let nc = NSWorkspace.shared.notificationCenter
         // 系统睡眠：SMC 的手动模式不会随睡眠消失，不交还的话风扇会按 80% 目标一路转到唤醒，
         // 因此这里必须同步（阻塞最多 5s）等释放命令下发完，比定时器轮询可靠。
-        observers.append(nc.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
+        workspaceObservers.append(nc.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
             self?.suspend(reason: .systemSleep, wait: true)
         })
         // 睡眠会重置 Ftst 与手动模式，唤醒后必须补发
-        observers.append(nc.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+        workspaceObservers.append(nc.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
             self?.start()
-            self?.isSuspended = false
-            self?.suspendReason = nil
-            self?.refresh()   // 若盖子仍合着（合盖唤醒），refresh 会继续保持挂起
+            self?.resumeIfPossible()   // 盖子仍合着 / 屏幕仍锁着时不会恢复
+            self?.refresh()
+            // 唤醒瞬间显示器可能还没点亮，稍后再试一次，避免风扇恢复被拖到下一个巡检周期
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                self?.resumeIfPossible()
+                self?.refresh()
+            }
+        })
+        // 屏幕睡眠（锁屏后黑屏）与锁屏：风扇被强制时系统根本走不到 willSleep——「风扇转着」
+        // 本身就是睡不下去的原因，等 willSleep 永远不会来。必须在黑屏/锁屏这一刻就交还
+        // 控制权，系统才能接着进入休眠；回来（亮屏/解锁/唤醒）后再自动恢复提速。
+        workspaceObservers.append(nc.addObserver(forName: NSWorkspace.screensDidSleepNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.suspend(reason: .displayOff, wait: false)
+        })
+        workspaceObservers.append(nc.addObserver(forName: NSWorkspace.screensDidWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.resumeIfPossible()
+        })
+        // 回到自己的会话（解锁 / 从快速用户切换切回）：兜住漏发的解锁通知
+        workspaceObservers.append(nc.addObserver(forName: NSWorkspace.sessionDidBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.screenLocked = false
+            self?.resumeIfPossible()
+        })
+
+        let dnc = DistributedNotificationCenter.default()
+        distributedObservers.append(dnc.addObserver(forName: Notification.Name("com.apple.screenIsLocked"), object: nil, queue: .main) { [weak self] _ in
+            self?.screenLocked = true
+            self?.suspend(reason: .screenLocked, wait: false)
+        })
+        distributedObservers.append(dnc.addObserver(forName: Notification.Name("com.apple.screenIsUnlocked"), object: nil, queue: .main) { [weak self] _ in
+            self?.screenLocked = false
+            self?.resumeIfPossible()
         })
     }
 
     deinit {
         let nc = NSWorkspace.shared.notificationCenter
-        observers.forEach(nc.removeObserver)
+        workspaceObservers.forEach(nc.removeObserver)
+        let dnc = DistributedNotificationCenter.default()
+        distributedObservers.forEach(dnc.removeObserver)
     }
 
     /// 记录用户意图：写 UserDefaults，并启/停巡检
     func setBoosted(_ fan: Int, _ on: Bool) {
         if on {
             boosted.insert(fan)
-            // 用户主动勾选 = 现在就要提速，清掉合盖/睡眠挂起
+            // 用户主动勾选 = 现在就要提速，清掉合盖/黑屏/锁屏/睡眠挂起
             isSuspended = false
             suspendReason = nil
+            restartTimer()
         } else {
             boosted.remove(fan)
         }
@@ -723,16 +761,25 @@ final class FanSupervisor {
         if !FeatureSettings.fanReleaseWhenClosed && isSuspended {
             isSuspended = false
             suspendReason = nil
+            restartTimer()
         }
         refresh()
     }
 
     // MARK: - 挂起 / 恢复
 
-    /// 是否应保持「已交还系统控制」：开关打开且盖子合着
+    /// 是否应保持「已交还系统控制」：开关打开且（合盖 / 屏幕已黑 / 已锁屏）
     private func shouldStayReleased() -> Bool {
         guard FeatureSettings.fanReleaseWhenClosed else { return false }
-        return FanControl.isLidClosed() == true
+        if FanControl.isLidClosed() == true { return true }
+        if isDisplayAsleep() { return true }
+        if screenLocked { return true }
+        return false
+    }
+
+    /// 主显示器是否已进入节能（黑屏）
+    private func isDisplayAsleep() -> Bool {
+        CGDisplayIsAsleep(CGMainDisplayID()) != 0
     }
 
     /// 交还控制权并停止补发。
@@ -749,6 +796,7 @@ final class FanSupervisor {
         let fans = count > 0 ? Array(0..<count) : Array(boosted)
         isSuspended = true
         suspendReason = reason
+        restartTimer()   // 挂起后降低巡检频率，避免后台反复唤醒把系统拖住
         if wait {
             // 阻塞主线程是有意为之：willSleep 通知处理完系统才会睡，异步补发赶不上
             FanControl.releaseAllAndWait(fans, timeout: 5)
@@ -763,6 +811,7 @@ final class FanSupervisor {
         guard isSuspended, !shouldStayReleased() else { return }
         isSuspended = false
         suspendReason = nil
+        restartTimer()
         refresh()
         NotificationCenter.default.post(name: .fanStateDidChange, object: nil)
     }
@@ -776,10 +825,17 @@ final class FanSupervisor {
 
     private func start() {
         guard timer == nil else { return }
-        let t = Timer(timeInterval: 5, repeats: true) { [weak self] _ in self?.refresh() }
+        let t = Timer(timeInterval: pollInterval, repeats: true) { [weak self] _ in self?.refresh() }
         t.tolerance = 1
         RunLoop.main.add(t, forMode: .common)
         timer = t
+    }
+
+    /// 按当前状态（是否挂起）重建巡检定时器
+    private func restartTimer() {
+        timer?.invalidate()
+        timer = nil
+        start()
     }
 
     private func stop() {

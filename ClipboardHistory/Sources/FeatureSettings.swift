@@ -11,7 +11,8 @@ enum FeatureSettings {
     /// 是否启用：⌃V 触发系统剪贴板（⌘Space → 延迟 → ⌘4）
     static let enableControlVSystemClipboardKey = "enableControlVSystemClipboard"
     
-    /// 是否启用：合盖 / 系统睡眠时自动把风扇交还系统控制（避免风扇在合盖后持续高速）
+    /// 是否启用：合盖 / 锁屏（黑屏）/ 系统睡眠时自动把风扇交还系统控制
+    /// （风扇被强制时系统无法进入休眠，不交还就会一直高速转着睡不下去）
     static let fanReleaseWhenClosedKey = "fanReleaseWhenClosed"
 
     /// 旧版迁移标记

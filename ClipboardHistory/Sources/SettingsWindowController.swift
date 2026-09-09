@@ -29,8 +29,8 @@ final class SettingsWindowController: NSWindowController {
     private var fanCheckboxes: [NSButton] = []   // tag = 风扇序号（0=左，1=右）
     private var fanStateObserver: NSObjectProtocol?
     private let fanStatusLabel = NSTextField(labelWithString: "")
-    private let fanReleaseCheckbox = NSButton(checkboxWithTitle: "合盖 / 睡眠时恢复系统控制", target: nil, action: nil)
-    private let fanReleaseHintLabel = NSTextField(labelWithString: "合盖或系统睡眠前把风扇交还系统，避免风扇在合盖后一直高速转动；开盖/唤醒后自动恢复提速")
+    private let fanReleaseCheckbox = NSButton(checkboxWithTitle: "合盖 / 锁屏 / 睡眠时恢复系统控制", target: nil, action: nil)
+    private let fanReleaseHintLabel = NSTextField(labelWithString: "合盖、锁屏（黑屏）或系统睡眠前把风扇交还系统——风扇被强制时系统无法休眠；亮屏/解锁/唤醒后自动恢复提速")
     private let fanHintLabel = NSTextField(labelWithString: "勾选后目标转速为最高转速的 80%（非满速，兼顾散热与噪音）；首次勾选需管理员授权（Touch ID/密码），被系统回收时会自动补发")
 
     // MARK: - 初始化
@@ -325,7 +325,14 @@ final class SettingsWindowController: NSWindowController {
         }
         // 挂起期间硬件确实已回到自动，复选框会显示为未勾选，这里说明原因避免误解
         if FanSupervisor.shared.isSuspended {
-            let reason = FanSupervisor.shared.suspendReason == .lid ? "合盖中" : "睡眠中"
+            let reason: String
+            switch FanSupervisor.shared.suspendReason {
+            case .lid:          reason = "合盖中"
+            case .displayOff:   reason = "屏幕已关闭"
+            case .screenLocked: reason = "已锁屏"
+            case .systemSleep:  reason = "睡眠中"
+            case .none:         reason = "已暂停"
+            }
             status += "（\(reason)，已交还系统控制）"
         }
         fanStatusLabel.stringValue = status
