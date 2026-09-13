@@ -29,14 +29,22 @@ final class SettingsWindowController: NSWindowController {
     private var fanCheckboxes: [NSButton] = []   // tag = 风扇序号（0=左，1=右）
     private var fanStateObserver: NSObjectProtocol?
     private let fanStatusLabel = NSTextField(labelWithString: "")
+    private let fanPercentSlider = NSSlider(
+        value: FeatureSettings.fanBoostPercent,
+        minValue: FeatureSettings.fanBoostPercentMin,
+        maxValue: FeatureSettings.fanBoostPercentMax,
+        target: nil,
+        action: nil
+    )
+    private let fanPercentValueLabel = NSTextField(labelWithString: "")
     private let fanReleaseCheckbox = NSButton(checkboxWithTitle: "合盖 / 锁屏 / 睡眠时恢复系统控制", target: nil, action: nil)
     private let fanReleaseHintLabel = NSTextField(labelWithString: "合盖、锁屏（黑屏）或系统睡眠前把风扇交还系统——风扇被强制时系统无法休眠；亮屏/解锁/唤醒后自动恢复提速")
-    private let fanHintLabel = NSTextField(labelWithString: "勾选后目标转速为最高转速的 80%（非满速，兼顾散热与噪音）；首次勾选需管理员授权（Touch ID/密码），被系统回收时会自动补发")
+    private let fanHintLabel = NSTextField(labelWithString: "")
 
     // MARK: - 初始化
 
     init() {
-        let height: CGFloat = fanCount > 0 ? 560 : 400
+        let height: CGFloat = fanCount > 0 ? 600 : 400
         let panel = NSPanel(
             contentRect: NSRect(x: 0, y: 0, width: 420, height: height),
             styleMask: [.titled, .closable],
@@ -133,6 +141,11 @@ final class SettingsWindowController: NSWindowController {
         fanStatusLabel.textColor = .secondaryLabelColor
         fanHintLabel.font = .systemFont(ofSize: 11, weight: .regular)
         fanHintLabel.textColor = .secondaryLabelColor
+        fanPercentSlider.target = self
+        fanPercentSlider.action = #selector(onFanPercentChanged(_:))
+        fanPercentSlider.isContinuous = true
+        fanPercentValueLabel.font = .systemFont(ofSize: 11, weight: .medium)
+        fanPercentValueLabel.textColor = .secondaryLabelColor
         fanReleaseCheckbox.target = self
         fanReleaseCheckbox.action = #selector(onFanReleaseChanged(_:))
         fanReleaseHintLabel.font = .systemFont(ofSize: 11, weight: .regular)
@@ -140,7 +153,7 @@ final class SettingsWindowController: NSWindowController {
         fanReleaseHintLabel.maximumNumberOfLines = 2
         fanReleaseHintLabel.preferredMaxLayoutWidth = 360
         fanReleaseHintLabel.lineBreakMode = .byWordWrapping
-        fanHintLabel.maximumNumberOfLines = 3
+        fanHintLabel.maximumNumberOfLines = 4
         fanHintLabel.preferredMaxLayoutWidth = 360
         fanHintLabel.lineBreakMode = .byWordWrapping
 
@@ -188,18 +201,24 @@ final class SettingsWindowController: NSWindowController {
         
         // 风扇设置堆叠（风扇 0=左，风扇 1=右；无风扇机型不显示该区块）
         var fanSectionViews: [NSView] = []
+        var fanPercentRow: NSView?
         if fanCount > 0 {
             let fanTitle = NSTextField(labelWithString: "风扇")
             fanTitle.font = .systemFont(ofSize: 14, weight: .semibold)
 
-            let names = fanCount >= 2 ? ["左风扇高速（80%）", "右风扇高速（80%）"] : ["风扇高速（80%）"]
-            for i in 0..<min(fanCount, names.count) {
-                let cb = NSButton(checkboxWithTitle: names[i], target: self, action: #selector(onFanCheckboxChanged(_:)))
+            for i in 0..<min(fanCount, 2) {
+                let cb = NSButton(checkboxWithTitle: "", target: self, action: #selector(onFanCheckboxChanged(_:)))
                 cb.tag = i
                 fanCheckboxes.append(cb)
             }
+            applyFanCheckboxTitles(FeatureSettings.fanBoostPercent)
 
-            let fanStack = NSStackView(views: fanCheckboxes + [fanStatusLabel, fanHintLabel,
+            // 百分比滑块：拖动中只更新读数，松手才落库并重新下发（避免逐像素触发一次提权）
+            let percentRow = labeledSliderRow(label: "提速目标转速", slider: fanPercentSlider,
+                                              valueLabel: fanPercentValueLabel, labelWidth: 96)
+            fanPercentRow = percentRow
+
+            let fanStack = NSStackView(views: fanCheckboxes + [percentRow, fanStatusLabel, fanHintLabel,
                                                                fanReleaseCheckbox, fanReleaseHintLabel])
             fanStack.orientation = .vertical
             fanStack.alignment = .leading
@@ -223,19 +242,24 @@ final class SettingsWindowController: NSWindowController {
         
         root.addSubview(stack)
         
-        NSLayoutConstraint.activate([
+        var constraints = [
             stack.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 16),
             stack.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -16),
             stack.topAnchor.constraint(equalTo: root.topAnchor, constant: 16),
             stack.bottomAnchor.constraint(lessThanOrEqualTo: root.bottomAnchor, constant: -16),
-            
+
             historyRow.trailingAnchor.constraint(equalTo: stack.trailingAnchor),
             cardRow.trailingAnchor.constraint(equalTo: stack.trailingAnchor),
             buttons.trailingAnchor.constraint(equalTo: stack.trailingAnchor)
-        ])
+        ]
+        if let fanPercentRow {
+            constraints.append(fanPercentRow.trailingAnchor.constraint(equalTo: stack.trailingAnchor))
+        }
+        NSLayoutConstraint.activate(constraints)
     }
     
-    private func labeledSliderRow(label: String, slider: NSSlider, valueLabel: NSTextField) -> NSView {
+    private func labeledSliderRow(label: String, slider: NSSlider, valueLabel: NSTextField,
+                                  labelWidth: CGFloat = 140) -> NSView {
         let name = NSTextField(labelWithString: label)
         name.font = .systemFont(ofSize: 12, weight: .regular)
         
@@ -249,7 +273,7 @@ final class SettingsWindowController: NSWindowController {
         row.translatesAutoresizingMaskIntoConstraints = false
         
         NSLayoutConstraint.activate([
-            name.widthAnchor.constraint(equalToConstant: 140),
+            name.widthAnchor.constraint(equalToConstant: labelWidth),
             slider.widthAnchor.constraint(greaterThanOrEqualToConstant: 180),
             valueLabel.widthAnchor.constraint(equalToConstant: 54)
         ])
@@ -265,6 +289,7 @@ final class SettingsWindowController: NSWindowController {
         optionVAppClipboardCheckbox.state = FeatureSettings.enableOptionVAppClipboard ? .on : .off
         controlVSystemClipboardCheckbox.state = FeatureSettings.enableControlVSystemClipboard ? .on : .off
         launchAtLoginCheckbox.state = FeatureSettings.launchAtLogin ? .on : .off
+        refreshFanPercentUI()
         syncFanSection()
         refreshValueLabels()
     }
@@ -339,6 +364,45 @@ final class SettingsWindowController: NSWindowController {
         }
         fanStatusLabel.stringValue = status
         fanReleaseCheckbox.state = FeatureSettings.fanReleaseWhenClosed ? .on : .off
+    }
+
+    /// 复选框标题与提示文案随百分比变化
+    private func applyFanCheckboxTitles(_ percent: Double) {
+        guard !fanCheckboxes.isEmpty else { return }
+        let names = fanCount >= 2 ? ["左风扇提速", "右风扇提速"] : ["风扇提速"]
+        let percentText = "\(Int(percent.rounded()))%"
+        for cb in fanCheckboxes {
+            let name = names.indices.contains(cb.tag) ? names[cb.tag] : "风扇提速"
+            cb.title = "\(name)（\(percentText)）"
+        }
+    }
+
+    /// 按已保存的百分比刷新滑块、读数、复选框标题与提示文案
+    private func refreshFanPercentUI() {
+        guard fanCount > 0 else { return }
+        let percent = FeatureSettings.fanBoostPercent
+        if abs(fanPercentSlider.doubleValue - percent) > 0.01 {
+            fanPercentSlider.doubleValue = percent
+        }
+        fanPercentValueLabel.stringValue = "\(Int(percent))%"
+        applyFanCheckboxTitles(percent)
+        fanHintLabel.stringValue = "勾选后目标转速 = 建议最高转速 × \(Int(percent))%；被强制后系统不再随温度自动升速，不宜设得过低。首次勾选需管理员授权，被系统回收时会自动补发"
+    }
+
+    @objc private func onFanPercentChanged(_ sender: NSSlider) {
+        // 拖动过程中只更新读数：每动一下就落库会逐像素触发一次提权重新下发
+        let dragging = NSApp.currentEvent.map {
+            $0.type == .leftMouseDown || $0.type == .leftMouseDragged
+        } ?? false
+        if dragging {
+            fanPercentValueLabel.stringValue = "\(Int(sender.doubleValue.rounded()))%"
+            applyFanCheckboxTitles(sender.doubleValue)
+            return
+        }
+        // 松手（或键盘调整）才落库：内部会通知巡检器按新比例重设目标转速
+        FeatureSettings.setFanBoostPercent(sender.doubleValue)
+        refreshFanPercentUI()
+        syncFanSection()   // 状态行的「目标 RPM」随比例变化
     }
 
     @objc private func onFanReleaseChanged(_ sender: NSButton) {
@@ -423,14 +487,15 @@ final class SettingsWindowController: NSWindowController {
     }
     
     @objc private func onReset() {
+        // 必须先清掉巡检器的「期望提速」：恢复默认会把百分比改回 80%，若此刻仍有期望状态，
+        // 巡检器会立刻按新比例重下发，与下面的 auto 命令互相颠倒，可能出现「未勾选但仍是手动」
+        for cb in fanCheckboxes {
+            FanSupervisor.shared.setBoosted(cb.tag, false)
+            cb.state = .off
+        }
         AppearanceSettings.resetToDefaults()
         FeatureSettings.resetToDefaults()
         syncFromDefaults()
-        // 恢复默认 = 系统自动（取消提速）
-        for cb in fanCheckboxes {
-            cb.state = .off
-            FanSupervisor.shared.setBoosted(cb.tag, false)
-        }
         restoreNextFan()
     }
 

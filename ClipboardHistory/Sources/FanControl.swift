@@ -246,14 +246,14 @@ enum FanControl {
 
     // MARK: - 目标转速策略
 
-    /// 勾选后的目标转速 = 建议最高转速 × 该比例。
-    /// 不用满速：噪音/功耗随转速更高阶增长，80% 已能换到大部分散热能力。
-    static let boostRatio: Double = 0.8
+    /// 勾选后的目标转速 = 建议最高转速 × 该比例，比例由用户在设置里调整（默认 80%）。
+    /// 默认不用满速：噪音/功耗随转速更高阶增长，80% 已能换到大部分散热能力。
+    static var boostRatio: Double { FeatureSettings.fanBoostRatio }
 
     /// 勾选状态的 UserDefaults 键（UI、巡检器共用）
     static func enabledKey(_ fan: Int) -> String { "fanForceEnabled_\(fan)" }
 
-    /// 勾选后该风扇的目标转速（最高转速的 80%）
+    /// 勾选后该风扇的目标转速（最高转速 × 用户设定的百分比）
     static func targetRPM(_ fan: Int) -> Int? {
         guard let max = maxRPM(fan), max > 0 else { return nil }
         return Int((Double(max) * boostRatio).rounded())
@@ -340,7 +340,10 @@ enum FanControl {
     }
 
     /// 把某个风扇设为手动并指定目标转速（RPM）。仅应在 root 进程（--fanctl 子命令）中调用。
-    static func setTargetRPM(_ fan: Int, rpm: Double) throws {
+    /// - parameter fallbackRatio: Ftst 解锁后给「其余未勾选风扇」兜底目标转速所用的比例。
+    ///   提权子进程以 root 运行，读不到当前用户域的 UserDefaults（百分比设置），
+    ///   因此必须由上层显式传入，不能在此处读设置。
+    static func setTargetRPM(_ fan: Int, rpm: Double, fallbackRatio: Double) throws {
         let conn = try openConnection()
         defer { IOServiceClose(conn) }
 
@@ -364,14 +367,14 @@ enum FanControl {
         try writeKey(conn, "F\(fan)Tg", encoded)
 
         // Ftst 解锁会全局抑制系统热伺服，此时未勾选的风扇不会随温度升速，
-        // 必须一并给它们安全目标（同样 80%），否则存在过热风险。
+        // 必须一并给它们安全目标（同样按用户设定比例），否则存在过热风险。
         guard ftstIsSet(conn) else { return }
         for i in 0..<count where i != fan {
             guard let otherMax = try? readNumber(conn, "F\(i)Mx"), otherMax > 0 else { continue }
             guard let (otherKey, _) = modeKey(i, conn: conn) else { continue }
             guard (try? writeKey(conn, otherKey, [0x01])) != nil else { continue }
             if let (otherType, _) = try? readKey(conn, "F\(i)Tg"),
-               let enc = encodeNumber(otherMax * boostRatio, type: otherType) {
+               let enc = encodeNumber(otherMax * fallbackRatio, type: otherType) {
                 _ = try? writeKey(conn, "F\(i)Tg", enc)
             }
         }
@@ -467,11 +470,13 @@ enum FanControl {
         return probe.terminationStatus == 0
     }
 
-    /// 下发 / 取消某个风扇的提速；勾选后目标 = 最高转速的 80%（不是满速）。
+    /// 下发 / 取消某个风扇的提速；勾选后目标 = 最高转速 × 用户设定的百分比（不是满速）。
     /// - parameter allowSudoersInstall: 巡检器自动补发传 false，避免在后台弹出授权窗口。
     static func apply(_ fan: Int, boost enabled: Bool,
                      allowSudoersInstall: Bool = true,
                      completion: @escaping (Result<Void, FanError>) -> Void) {
+        // 百分比先在本进程取好：提权子进程以 root 运行，读不到当前用户域的 UserDefaults
+        let percent = Int(FeatureSettings.fanBoostPercent.rounded())
         DispatchQueue.global(qos: .userInitiated).async {
             let args: [String]
             if enabled {
@@ -479,7 +484,7 @@ enum FanControl {
                     DispatchQueue.main.async { completion(.failure(.noMaxRPM)) }
                     return
                 }
-                args = ["set", String(fan), String(rpm)]
+                args = ["set", String(fan), String(rpm), String(percent)]
             } else {
                 args = ["auto", String(fan)]
             }
@@ -582,10 +587,10 @@ enum FanControl {
     // MARK: - CLI 入口（--fanctl，供提权子进程与调试使用）
 
     /// 用法：
-    ///   --fanctl info            打印风扇信息（无需权限）
-    ///   --fanctl lid             打印盖子（合盖）状态（无需权限）
-    ///   --fanctl set <fan> <rpm> 设为手动模式并指定目标转速（需 root）
-    ///   --fanctl auto <fan>      恢复系统自动控制（需 root）
+    ///   --fanctl info                      打印风扇信息（无需权限）
+    ///   --fanctl lid                       打印盖子（合盖）状态（无需权限）
+    ///   --fanctl set <fan> <rpm> [percent] 设为手动模式并指定目标转速（需 root）
+    ///   --fanctl auto <fan>                恢复系统自动控制（需 root）
     static func runCLI(_ args: [String]) -> Int32 {
         guard MemoryLayout<SMCKeyData>.stride == 80 else {
             FileHandle.standardError.write(Data("SMC 数据结构布局异常\n".utf8))
@@ -596,13 +601,14 @@ enum FanControl {
         switch sub.first {
         case "info":
             let count = fanCount()
+            let percent = Int(FeatureSettings.fanBoostPercent.rounded())
             print("风扇数量: \(count)")
             for i in 0..<count {
                 let max = maxRPM(i).map { "\($0)" } ?? "?"
                 let cur = actualRPM(i).map { "\($0)" } ?? "?"
                 let target = targetRPM(i).map { "\($0)" } ?? "?"
                 let mode = modeRaw(i).map { "\($0)" } ?? "未知"
-                print("风扇 \(i): 当前 \(cur) RPM / 最大 \(max) RPM / 80% 目标 \(target) RPM / 模式 \(mode)")
+                print("风扇 \(i): 当前 \(cur) RPM / 最大 \(max) RPM / \(percent)% 目标 \(target) RPM / 模式 \(mode)")
             }
             return 0
 
@@ -615,13 +621,16 @@ enum FanControl {
             return 0
 
         case "set":
-            guard sub.count == 3, let fan = Int(sub[1]), let rpm = Double(sub[2]), rpm > 0 else {
-                FileHandle.standardError.write(Data("用法: --fanctl set <fan> <rpm>\n".utf8))
+            guard sub.count >= 3, let fan = Int(sub[1]), let rpm = Double(sub[2]), rpm > 0 else {
+                FileHandle.standardError.write(Data("用法: --fanctl set <fan> <rpm> [percent]\n".utf8))
                 return 1
             }
+            // 目标转速与百分比由上层算好传入（App 侧 = 最高转速 × 用户设定百分比），此处不读设置：
+            // 本分支以 root 运行，UserDefaults 落在 root 域，读不到当前用户的百分比
+            let percent = sub.count >= 4 ? (Double(sub[3]) ?? FeatureSettings.fanBoostPercent)
+                                         : FeatureSettings.fanBoostPercent
             do {
-                // 目标转速由上层算好传入（App 侧是最高转速的 80%），此处不再自行取最大值
-                try setTargetRPM(fan, rpm: rpm)
+                try setTargetRPM(fan, rpm: rpm, fallbackRatio: min(max(percent, 1), 100) / 100)
                 print("风扇 \(fan) 已设为手动，目标 \(Int(rpm)) RPM")
                 return 0
             } catch {
@@ -644,7 +653,7 @@ enum FanControl {
             }
 
         default:
-            FileHandle.standardError.write(Data("用法: --fanctl info | lid | set <fan> <rpm> | auto <fan>\n".utf8))
+            FileHandle.standardError.write(Data("用法: --fanctl info | lid | set <fan> <rpm> [percent] | auto <fan>\n".utf8))
             return 1
         }
     }
@@ -666,13 +675,15 @@ final class FanSupervisor {
     /// 挂起（已交还系统控制）的原因
     enum SuspendReason { case lid, systemSleep, displayOff, screenLocked, screenSaver, offConsole }
 
-    /// 期望处于手动（80%）状态的风扇序号
+    /// 期望处于手动（按用户设定百分比）状态的风扇序号
     private(set) var boosted: Set<Int> = []
     /// 已交还系统控制、停止补发（合盖、黑屏、锁屏或系统睡眠）
     private(set) var isSuspended = false
     private(set) var suspendReason: SuspendReason?
     private var timer: Timer?
     private var busy = false
+    /// 下发进行中时用户又改了百分比：当前队列跑完后按新比例再补一轮
+    private var awaitingReapply = false
     private var workspaceObservers: [NSObjectProtocol] = []
     private var distributedObservers: [NSObjectProtocol] = []
     /// 是否已锁屏（CGSSessionScreenIsLocked 已从 CGSessionCopyCurrentDictionary 移除，
@@ -689,7 +700,7 @@ final class FanSupervisor {
         boosted = Set((0..<count).filter { UserDefaults.standard.bool(forKey: FanControl.enabledKey($0)) })
 
         let nc = NSWorkspace.shared.notificationCenter
-        // 系统睡眠：SMC 的手动模式不会随睡眠消失，不交还的话风扇会按 80% 目标一路转到唤醒，
+        // 系统睡眠：SMC 的手动模式不会随睡眠消失，不交还的话风扇会按设定目标一路转到唤醒，
         // 因此这里必须同步（阻塞最多 5s）等释放命令下发完，比定时器轮询可靠。
         workspaceObservers.append(nc.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
             self?.suspend(reason: .systemSleep, wait: true)
@@ -782,6 +793,19 @@ final class FanSupervisor {
         refresh()
     }
 
+    /// 用户调整提速百分比后，立刻按新比例重设所有「期望提速」风扇的目标转速。
+    /// 模式位仍是手动（Mode 1/2）时 refresh() 判定「没有丢失」而不会补发，必须显式重下。
+    func boostPercentDidChange() {
+        guard !boosted.isEmpty, !isSuspended else { return }
+        start()
+        // 尚未授权时静默跳过：等用户手动勾选走一次授权流程即可
+        guard FanControl.canRunPrivilegedSilently() else { return }
+        // 已有下发在飞：当前轮用的是旧比例，记账等队列跑完再补一轮
+        guard !busy else { awaitingReapply = true; return }
+        busy = true
+        applyNext(Array(boosted))
+    }
+
     // MARK: - 挂起 / 恢复
 
     /// 是否应保持「已交还系统控制」：开关打开且人不在这台机器前
@@ -816,7 +840,7 @@ final class FanSupervisor {
         // 可能还没跑完系统就睡了，setAuto 幂等，重发一次确保睡眠前已交还控制权
         guard !isSuspended || wait else { return }
         // 必须释放「全部」风扇而不是只释放勾选的：M3/M4 走 Ftst 解锁时
-        // setTargetRPM 会把未勾选的风扇一并设成手动 80%，只释放勾选的那些会导致
+        // setTargetRPM 会把未勾选的风扇一并设成手动（按设定比例），只释放勾选的那些会导致
         // 其余风扇继续手动，且 setAuto 里的 anyFanForced 检查会因此拒绝复位 Ftst。
         let count = FanControl.fanCount()
         let fans = count > 0 ? Array(0..<count) : Array(boosted)
@@ -895,11 +919,11 @@ final class FanSupervisor {
 
     private func applyNext(_ queue: [Int]) {
         guard let fan = queue.first else {
-            busy = false
+            finishApplyQueue()
             return
         }
         // 补发途中被挂起（系统睡眠/合盖）：立刻停手，否则会和释放命令互相打架
-        guard !isSuspended else { busy = false; return }
+        guard !isSuspended else { finishApplyQueue(); return }
         FanControl.apply(fan, boost: true, allowSudoersInstall: false) { [weak self] result in
             guard let self else { return }
             if case .failure = result {
@@ -910,6 +934,14 @@ final class FanSupervisor {
             }
             self.applyNext(Array(queue.dropFirst()))
         }
+    }
+
+    /// 一轮下发结束：解除忙碌位，若期间百分比又被调整过则按新比例再来一轮
+    private func finishApplyQueue() {
+        busy = false
+        guard awaitingReapply else { return }
+        awaitingReapply = false
+        boostPercentDidChange()
     }
 }
 

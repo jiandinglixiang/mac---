@@ -15,6 +15,14 @@ enum FeatureSettings {
     /// （风扇被强制时系统无法进入休眠，不交还就会一直高速转着睡不下去）
     static let fanReleaseWhenClosedKey = "fanReleaseWhenClosed"
 
+    /// 风扇提速目标转速（占建议最高转速的百分比），用户可在 20%~100% 之间调整
+    static let fanBoostPercentKey = "fanBoostPercent"
+
+    /// 百分比取值范围：下限防止强制低速导致过热，上限即建议最高转速
+    static let fanBoostPercentMin: Double = 20
+    static let fanBoostPercentMax: Double = 100
+    static let fanBoostPercentDefault: Double = 80
+
     /// 旧版迁移标记
     private static let migrationKey = "hasMigratedFeatureSettingsV2"
     
@@ -52,6 +60,30 @@ enum FeatureSettings {
     static func setFanReleaseWhenClosed(_ enabled: Bool) {
         UserDefaults.standard.set(enabled, forKey: fanReleaseWhenClosedKey)
         FanSupervisor.shared.releaseSettingDidChange()
+    }
+
+    // MARK: - 风扇提速百分比
+
+    /// 未设置过时默认 80%，避免依赖 register(defaults:) 的执行顺序
+    static var fanBoostPercent: Double {
+        guard UserDefaults.standard.object(forKey: fanBoostPercentKey) != nil else {
+            return fanBoostPercentDefault
+        }
+        return clampFanBoostPercent(UserDefaults.standard.double(forKey: fanBoostPercentKey))
+    }
+
+    /// 百分比倍数（0.2 ~ 1.0），供 FanControl 计算目标转速
+    static var fanBoostRatio: Double { fanBoostPercent / 100 }
+
+    /// 更新百分比：取整后落库，并让巡检器立刻按新比例重新下发目标转速
+    static func setFanBoostPercent(_ value: Double) {
+        UserDefaults.standard.set(clampFanBoostPercent(value.rounded()), forKey: fanBoostPercentKey)
+        FanSupervisor.shared.boostPercentDidChange()
+    }
+
+    private static func clampFanBoostPercent(_ value: Double) -> Double {
+        guard value.isFinite else { return fanBoostPercentDefault }
+        return min(max(value, fanBoostPercentMin), fanBoostPercentMax)
     }
     
     // MARK: - 开机启动 (SMAppService)
@@ -100,6 +132,7 @@ enum FeatureSettings {
         setEnableOptionVAppClipboard(true)
         setEnableControlVSystemClipboard(false)
         setFanReleaseWhenClosed(true)
+        setFanBoostPercent(fanBoostPercentDefault)
         // 注意：不重置 launchAtLogin，因为它是系统级设置
     }
 }
