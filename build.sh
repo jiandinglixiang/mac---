@@ -60,6 +60,8 @@ SRC_FILES=(
     "$PROJECT_DIR/ClipboardHistory/Sources/SettingsWindowController.swift"
     "$PROJECT_DIR/ClipboardHistory/Sources/AppearanceSettings.swift"
     "$PROJECT_DIR/ClipboardHistory/Sources/FeatureSettings.swift"
+    "$PROJECT_DIR/ClipboardHistory/Sources/HistoryStore.swift"
+    "$PROJECT_DIR/ClipboardHistory/Sources/ThumbnailCache.swift"
     "$PROJECT_DIR/ClipboardHistory/Sources/FanControl.swift"
     "$PROJECT_DIR/ClipboardHistory/Sources/AppDelegate.swift"
     "$PROJECT_DIR/ClipboardHistory/Sources/main.swift"

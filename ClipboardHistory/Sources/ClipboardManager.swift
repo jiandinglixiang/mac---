@@ -7,41 +7,43 @@ class ClipboardManager {
     private let pasteboard = NSPasteboard.general
     private(set) var history: [ClipboardItem] = []
     private let maxHistorySize = 200
-    private let userDefaults = UserDefaults.standard
-    private let historyKey = "clipboardHistory"
+    /// 历史持久化（元数据 JSON + 图片独立文件，IO 与编解码全在后台队列）
+    private let store = HistoryStore.shared
     private var ignoreChangesRemaining: Int = 0
+    /// 是否已完成历史加载（未完成时窗口打开会先显示空列表，加载完成后广播刷新）
+    private(set) var isHistoryLoaded = false
 
     struct PasteboardSnapshot {
         let items: [NSPasteboardItem]
         let changeCount: Int
     }
-    
+
     init() {
         lastChangeCount = pasteboard.changeCount
         loadHistory()
     }
-    
+
     // 开始监听剪贴板
     func startMonitoring() {
         timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             self?.checkPasteboard()
         }
-        
+
         print("开始监听剪贴板变化")
     }
-    
+
     // 停止监听
     func stopMonitoring() {
         timer?.invalidate()
         timer = nil
-        saveHistory()
+        store.save(history)
         print("停止监听剪贴板")
     }
-    
+
     // 检查剪贴板变化
     private func checkPasteboard() {
         let changeCount = pasteboard.changeCount
-        
+
         if changeCount != lastChangeCount {
             lastChangeCount = changeCount
             if ignoreChangesRemaining > 0 {
@@ -51,14 +53,14 @@ class ClipboardManager {
             captureClipboard()
         }
     }
-    
+
     // 捕获剪贴板内容
     private func captureClipboard() {
         // 获取剪贴板中的所有类型
         guard let types = pasteboard.types else { return }
-        
+
         var newItem: ClipboardItem?
-        
+
         // 优先处理文件
         if types.contains(.fileURL) {
             if let urls = pasteboard.readObjects(forClasses: [NSURL.self]) as? [URL], !urls.isEmpty {
@@ -88,13 +90,13 @@ class ClipboardManager {
                 }
             }
         }
-        
+
         // 添加到历史记录
         if let item = newItem {
             addToHistory(item)
         }
     }
-    
+
     // 添加到历史记录
     private func addToHistory(_ item: ClipboardItem) {
         // 避免重复添加相同内容
@@ -103,25 +105,29 @@ class ClipboardManager {
                 return
             }
         }
-        
+
         history.insert(item, at: 0)
-        
+
         // 限制历史记录数量
-        if history.count > maxHistorySize {
-            history.removeLast()
+        while history.count > maxHistorySize {
+            let dropped = history.removeLast()
+            if let fileName = dropped.imageFileName {
+                ThumbnailCache.shared.remove(id: dropped.id)
+                store.removeImage(fileName: fileName)
+            }
         }
-        
-        saveHistory()
-        
+
+        store.save(history)
+
         print("添加剪贴板项: \(item.type)")
     }
-    
+
     // 比较两个项是否相同
     private func areItemsEqual(_ item1: ClipboardItem, _ item2: ClipboardItem) -> Bool {
         if item1.type != item2.type {
             return false
         }
-        
+
         switch item1.type {
         case .text:
             return item1.textContent == item2.textContent
@@ -130,17 +136,17 @@ class ClipboardManager {
         case .file:
             return item1.fileURLs == item2.fileURLs
         case .image:
-            // 简单比较图片数据大小
-            return item1.imageData?.count == item2.imageData?.count
+            // 简单比较图片数据大小（用记录的字节数，避免为去重去读磁盘）
+            return item1.imageByteCount == item2.imageByteCount
         case .unknown:
             return false
         }
     }
-    
+
     // 将项目复制回剪贴板
     func copyToClipboard(_ item: ClipboardItem) {
         pasteboard.clearContents()
-        
+
         switch item.type {
         case .text:
             if let text = item.textContent {
@@ -161,7 +167,7 @@ class ClipboardManager {
         case .unknown:
             break
         }
-        
+
         // 更新 changeCount 以避免重复捕获
         lastChangeCount = pasteboard.changeCount
     }
@@ -192,41 +198,44 @@ class ClipboardManager {
         }
         lastChangeCount = pasteboard.changeCount
     }
-    
-    // 保存历史记录
-    private func saveHistory() {
-        do {
-            let encoder = JSONEncoder()
-            let data = try encoder.encode(history)
-            userDefaults.set(data, forKey: historyKey)
-        } catch {
-            print("保存历史记录失败: \(error)")
-        }
-    }
-    
-    // 加载历史记录
+
+    // 加载历史记录：先做旧数据迁移，再从文件存储读取；全部在后台队列，完成后主线程提交
     private func loadHistory() {
-        if let data = userDefaults.data(forKey: historyKey) {
-            do {
-                let decoder = JSONDecoder()
-                history = try decoder.decode([ClipboardItem].self, from: data)
-                print("加载了 \(history.count) 条历史记录")
-            } catch {
-                print("加载历史记录失败: \(error)")
+        store.migrateFromUserDefaultsIfNeeded { [weak self] in
+            guard let self else { return }
+            self.store.load { [weak self] items in
+                guard let self else { return }
+                self.history = items
+                self.isHistoryLoaded = true
+                print("加载了 \(items.count) 条历史记录")
+                NotificationCenter.default.post(name: .clipboardHistoryDidLoad, object: nil)
             }
         }
     }
-    
+
     // 清空历史记录
     func clearHistory() {
         history.removeAll()
-        saveHistory()
+        ThumbnailCache.shared.removeAll()
+        store.clear()
         print("历史记录已清空")
     }
-    
+
     // 删除指定项
     func deleteItem(_ item: ClipboardItem) {
+        let removed = history.filter { $0.id == item.id }
         history.removeAll { $0.id == item.id }
-        saveHistory()
+        for dropped in removed {
+            ThumbnailCache.shared.remove(id: dropped.id)
+            if let fileName = dropped.imageFileName {
+                store.removeImage(fileName: fileName)
+            }
+        }
+        store.save(history)
     }
+}
+
+extension Notification.Name {
+    /// 历史记录加载完成（窗口若已打开需要刷新内容）
+    static let clipboardHistoryDidLoad = Notification.Name("clipboardHistoryDidLoad")
 }

@@ -1,11 +1,6 @@
 import Cocoa
 import ApplicationServices
 
-// MARK: - 透明毛玻璃背景视图（不拦截鼠标事件）
-final class PassthroughVisualEffectView: NSVisualEffectView {
-    override func hitTest(_ point: NSPoint) -> NSView? { nil }
-}
-
 // MARK: - NSView 工具：向上查找某种类型的父视图
 extension NSView {
     func enclosingView<T: NSView>(ofType type: T.Type) -> T? {
@@ -31,15 +26,26 @@ class KeyableWindow: NSWindow {
 
 class HistoryWindowController: NSWindowController, NSWindowDelegate {
     private var window_: NSWindow?
-    private var scrollView: NSScrollView!
+    private var scrollView: HorizontalScrollView!
     private var containerView: NSView!
     private var backgroundEffectView: NSVisualEffectView?
     private var items: [ClipboardItem] = []
-    private var itemViews: [ClipboardItemView] = []
+    /// 卡片视图池：只保留「可见区 + 两侧缓冲」这么多张卡片视图，滚动时复用并只更新内容。
+    /// 注意：池视图的数组下标与 `items` 不再一一对应，每张视图用自己的 `index` 记录它当前代表的条目。
+    private var cardPool: [ClipboardItemView] = []
     private var selectedIndex: Int = 0
     private var previousActiveApp: NSRunningApplication?  // 记住之前的活动应用
     private var appearanceObserver: NSObjectProtocol?
+    private var clipViewBoundsObserver: NSObjectProtocol?
     private var isRestoringFocus: Bool = false
+
+    // 卡片布局常量（建池、点击命中、滚动定位共用同一套算法）
+    private let cardWidth: CGFloat = 180
+    private let cardSpacing: CGFloat = 10
+    private let cardVerticalPadding: CGFloat = 16
+    private let cardLeftPadding: CGFloat = 16
+    /// 可见区两侧各多留几张卡片，让它们提前就位，滚动时不会露白
+    private let cardOverscan = 2
     
     override var window: NSWindow? {
         get { return window_ }
@@ -60,6 +66,9 @@ class HistoryWindowController: NSWindowController, NSWindowDelegate {
     deinit {
         if let appearanceObserver {
             NotificationCenter.default.removeObserver(appearanceObserver)
+        }
+        if let clipViewBoundsObserver {
+            NotificationCenter.default.removeObserver(clipViewBoundsObserver)
         }
     }
     
@@ -91,7 +100,9 @@ class HistoryWindowController: NSWindowController, NSWindowDelegate {
         window.level = .floating
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         window.isReleasedWhenClosed = false
-        window.hasShadow = true
+        // 关掉系统窗口阴影：这是全宽 + 非不透明(isOpaque=false) + 内容每帧变化的窗口，
+        // 窗口阴影会由内容 alpha 反复重算，是 WindowServer 占用居高不下的主要来源之一。
+        window.hasShadow = false
         window.delegate = self
         
         // 创建主容器
@@ -122,7 +133,19 @@ class HistoryWindowController: NSWindowController, NSWindowDelegate {
         // 替换默认的 clipView 为自定义的
         let customClipView = HorizontalClipView(frame: scrollView.contentView.frame)
         customClipView.drawsBackground = false
+        customClipView.postsBoundsChangedNotifications = true
         scrollView.contentView = customClipView
+
+        // 滚动时按可见区间刷新卡片池（覆盖滚轮、弹性回弹、程序化滚动等所有路径）。
+        // queue 传 nil：同步回调，保证新卡片在本次滚动绘制前就位，不会露出空白。
+        clipViewBoundsObserver = NotificationCenter.default.addObserver(
+            forName: NSView.boundsDidChangeNotification,
+            object: customClipView,
+            queue: nil
+        ) { [weak self] _ in
+            self?.refreshVisibleCards()
+        }
+        scrollView.historyWindowController = self
         
         scrollView.hasHorizontalScroller = false
         scrollView.hasVerticalScroller = false
@@ -163,17 +186,18 @@ class HistoryWindowController: NSWindowController, NSWindowDelegate {
     private func applyAppearanceSettings() {
         // 只调背景毛玻璃的透明度，避免整体窗口（包括文字）一起变透明
         backgroundEffectView?.alphaValue = AppearanceSettings.historyBackgroundAlpha
-        itemViews.forEach { $0.applyCardAppearanceSettings() }
+        cardPool.forEach { $0.applyCardAppearanceSettings() }
     }
-    
+
     /// 根据窗口坐标定位被点击的卡片（不依赖 AppKit hitTest），用于解决“点A贴B”的错位问题。
     /// - Parameter pointInWindow: `event.locationInWindow`
     func itemAtWindowPoint(_ pointInWindow: NSPoint) -> ClipboardItem? {
         // 把窗口坐标转换到 containerView 坐标系（会自动包含 scrollView 的偏移）
         let pointInContainer = containerView.convert(pointInWindow, from: nil)
-        
-        // 从后往前找（更贴近 Z-order：后添加的视图在更上层）
-        for view in itemViews.reversed() {
+
+        // 从后往前找（更贴近 Z-order：后添加的视图在更上层）。
+        // 池化后卡片视图索引与 items 不再一一对应，所以一律通过视图自己绑定的 boundItem 取内容。
+        for view in cardPool.reversed() where !view.isHidden {
             if view.frame.contains(pointInContainer), let item = view.boundItem {
                 return item
             }
@@ -209,9 +233,9 @@ class HistoryWindowController: NSWindowController, NSWindowDelegate {
 
         // 优先使用 AppDelegate 传入的“最后一个非本应用前台App”，更可靠
         self.previousActiveApp = previousActiveApp
-        
-        updateItemViews()
-        
+
+        rebuildCardPool()
+
         // 显示窗口
         window?.makeKeyAndOrderFront(nil)
         window?.orderFrontRegardless()
@@ -223,62 +247,104 @@ class HistoryWindowController: NSWindowController, NSWindowDelegate {
         }
         
         // 选中第一个项目
-        if !itemViews.isEmpty {
+        if !items.isEmpty {
             selectItem(at: 0)
         }
     }
-    
-    private func updateItemViews() {
-        // 清除旧的视图
-        itemViews.forEach { $0.removeFromSuperview() }
-        itemViews.removeAll()
-        
-        guard !items.isEmpty else {
-            containerView.frame.size.width = 0
-            return
+
+    /// 历史记录异步加载完成后刷新窗口内容（数据源发生变化，整体重建卡片池）
+    func updateItems(_ items: [ClipboardItem]) {
+        guard window?.isVisible == true else { return }
+        self.items = items
+        selectedIndex = min(selectedIndex, max(0, items.count - 1))
+        rebuildCardPool()
+        if !items.isEmpty {
+            selectItem(at: selectedIndex)
         }
-        
-        // 可用内容高度（与滚动视图高度一致）
-        let availableHeight = scrollView.frame.height
-        
-        // 项目尺寸 - 上下边距
-        let verticalPadding: CGFloat = 16
-        let itemWidth: CGFloat = 180
-        let itemHeight = availableHeight - (verticalPadding * 2) // 卡片高度
-        let itemSpacing: CGFloat = 10
-        let leftPadding: CGFloat = 16
-        
-        // 容器视图高度与滚动视图高度一致（防止垂直滚动）
-        containerView.frame.size.height = availableHeight
-        
-        // 创建横向排列的项目视图
-        for (index, item) in items.enumerated() {
-            let x = leftPadding + CGFloat(index) * (itemWidth + itemSpacing)
-            let y = verticalPadding
-            
-            let itemView = ClipboardItemView(
-                frame: NSRect(x: x, y: y, width: itemWidth, height: itemHeight)
+    }
+    
+    // MARK: - 卡片视图池
+
+    /// 卡片高度（随窗口高度变化）
+    private var cardHeight: CGFloat {
+        max(40, scrollView.frame.height - (cardVerticalPadding * 2))
+    }
+
+    /// 第 index 张卡片的 x 坐标：卡片位置只由 index 决定，
+    /// 因此点击命中（frame.contains）与滚动定位都不依赖池视图的数组下标
+    private func cardX(for index: Int) -> CGFloat {
+        cardLeftPadding + CGFloat(index) * (cardWidth + cardSpacing)
+    }
+
+    /// 重建卡片池：只在打开窗口 / 条目集合变化（删除、加载完成）时调用。
+    /// 改前这里会一次性创建 200 张卡片（实测 227 ms、共 1200 个子视图），
+    /// 现在只创建一屏可见的十几张，滚动时复用。
+    private func rebuildCardPool() {
+        cardPool.forEach { $0.removeFromSuperview() }
+        cardPool.removeAll()
+
+        containerView.frame = NSRect(x: 0, y: 0, width: scrollView.frame.width, height: scrollView.frame.height)
+        updateContainerWidth()
+
+        guard !items.isEmpty else { return }
+
+        // 池容量 = 一屏可见张数 + 两侧缓冲
+        let visibleCount = Int(ceil(scrollView.frame.width / (cardWidth + cardSpacing))) + 1
+        let poolSize = min(items.count, visibleCount + cardOverscan * 2 + 1)
+        let height = cardHeight
+
+        for _ in 0..<poolSize {
+            let card = ClipboardItemView(
+                frame: NSRect(x: 0, y: cardVerticalPadding, width: cardWidth, height: height)
             )
-            itemView.configure(with: item, index: index)
+            card.isHidden = true
             // 关键修复：点击绑定到“item本体/ID”，而不是 index。
             // 否则一旦 items 在窗口显示期间发生插入/重排（例如剪贴板监控更新 history），就会出现“点A卡片却按 index 取到B内容”的错位。
-            itemView.onClick = { [weak self] clickedItem in
+            card.onClick = { [weak self] clickedItem in
                 self?.handleItemClick(clickedItem)
             }
-            // 移除双击处理，统一为单击即粘贴
-            // itemView.onDoubleClick = { [weak self] in
-            //     self?.selectAndPaste(item)
-            // }
-            
-            containerView.addSubview(itemView)
-            itemViews.append(itemView)
+            containerView.addSubview(card)
+            cardPool.append(card)
         }
-        
-        // 更新容器视图宽度
-        let totalWidth = leftPadding + CGFloat(items.count) * (itemWidth + itemSpacing) + leftPadding
-        containerView.frame.size.width = max(totalWidth, scrollView.frame.width)
 
-        applyAppearanceSettings()
+        refreshVisibleCards()
+    }
+
+    /// 只刷新「可见区 + 缓冲」区间内的卡片：区间内已由某张池视图代表的 index 完全不碰，
+    /// 只有新进入区间的 index 才占用一张空闲视图并重新配置（滚动时通常只有 1 张在变）。
+    fileprivate func refreshVisibleCards() {
+        guard !items.isEmpty, !cardPool.isEmpty else { return }
+
+        let visibleRect = scrollView.documentVisibleRect
+        let step = cardWidth + cardSpacing
+        let first = max(0, Int(floor((visibleRect.minX - cardLeftPadding) / step)) - cardOverscan)
+        let last = min(items.count - 1, Int(ceil((visibleRect.maxX - cardLeftPadding) / step)) + cardOverscan)
+        guard first <= last else { return }
+
+        // 当前区间外的池视图都是可复用的空闲视图
+        var freeCards = cardPool.filter { $0.index < first || $0.index > last }
+        let height = cardHeight
+
+        for index in first...last where !cardPool.contains(where: { $0.index == index }) {
+            guard !freeCards.isEmpty else { break }
+            let card = freeCards.removeFirst()
+            card.index = index
+            card.frame = NSRect(x: cardX(for: index), y: cardVerticalPadding, width: cardWidth, height: height)
+            card.isHidden = false
+            card.configure(with: items[index], index: index)
+            card.setSelected(index == selectedIndex)
+        }
+
+        // 离开区间的卡片移出视口后隐藏（下次滚动到附近时复用）
+        for card in cardPool where card.index < first || card.index > last {
+            card.isHidden = true
+        }
+    }
+
+    /// 容器宽度按条目总数计算（池化后仍保留完整滚动范围与弹性滚动）
+    private func updateContainerWidth() {
+        let totalWidth = cardLeftPadding + CGFloat(items.count) * (cardWidth + cardSpacing) + cardLeftPadding
+        containerView.frame.size.width = max(totalWidth, scrollView.frame.width)
     }
     
     fileprivate func handleItemClick(_ item: ClipboardItem) {
@@ -287,32 +353,33 @@ class HistoryWindowController: NSWindowController, NSWindowDelegate {
     }
     
     private func selectItem(at index: Int) {
-        guard index >= 0 && index < itemViews.count else { return }
-        
-        // 取消选中所有项目
-        itemViews.forEach { $0.setSelected(false) }
-        
-        // 选中当前项目
+        guard index >= 0 && index < items.count else { return }
+
         selectedIndex = index
-        itemViews[index].setSelected(true)
-        
-        // 滚动到可见区域
+        // 池视图只负责显示「自己当前代表的 index」是否被选中，不依赖数组下标
+        for card in cardPool where !card.isHidden {
+            card.setSelected(card.index == index)
+        }
+
+        // 滚动到可见区域（目标卡片可能还在可视区外，滚动后由 bounds 变化通知把它配置出来）
         scrollToItem(at: index)
     }
-    
+
     private func scrollToItem(at index: Int) {
-        guard index >= 0 && index < itemViews.count else { return }
-        
-        let itemView = itemViews[index]
+        guard index >= 0 && index < items.count else { return }
+
         let visibleRect = scrollView.documentVisibleRect
-        let itemFrame = itemView.frame
-        
+        let minX = cardX(for: index)
+        let maxX = minX + cardWidth
+
         // 如果项目不在可见区域，滚动到该位置
-        if itemFrame.maxX > visibleRect.maxX {
-            let newX = itemFrame.maxX - scrollView.frame.width + 50
+        if maxX > visibleRect.maxX {
+            let newX = maxX - scrollView.frame.width + 50
             scrollView.contentView.scroll(to: NSPoint(x: max(0, newX), y: 0))
-        } else if itemFrame.minX < visibleRect.minX {
-            scrollView.contentView.scroll(to: NSPoint(x: max(0, itemFrame.minX - 20), y: 0))
+            scrollView.reflectScrolledClipView(scrollView.contentView)
+        } else if minX < visibleRect.minX {
+            scrollView.contentView.scroll(to: NSPoint(x: max(0, minX - 20), y: 0))
+            scrollView.reflectScrolledClipView(scrollView.contentView)
         }
     }
     
@@ -441,7 +508,7 @@ class HistoryWindowController: NSWindowController, NSWindowDelegate {
                 selectAndPaste(items[selectedIndex])
             }
         case 124, 125: // 右箭头(124) 或 下箭头(125) - 选择下一个
-            if selectedIndex < itemViews.count - 1 {
+            if selectedIndex < items.count - 1 {
                 selectItem(at: selectedIndex + 1)
             }
         case 123, 126: // 左箭头(123) 或 上箭头(126) - 选择上一个
@@ -466,20 +533,20 @@ class HistoryWindowController: NSWindowController, NSWindowDelegate {
     private func deleteItem(at index: Int) {
         guard index >= 0 && index < items.count else { return }
         let item = items[index]
-        
+
         // 从管理器中删除
         if let appDelegate = NSApp.delegate as? AppDelegate {
             appDelegate.clipboardManager?.deleteItem(item)
-            
-            // 更新本地列表
+
+            // 更新本地列表：条目集合变了，整体重建卡片池
             if let updatedItems = appDelegate.clipboardManager?.history {
                 self.items = updatedItems
-                updateItemViews()
-                
+                selectedIndex = min(index, max(0, updatedItems.count - 1))
+                rebuildCardPool()
+
                 // 重新选择项目
-                if !itemViews.isEmpty {
-                    let newIndex = min(index, itemViews.count - 1)
-                    selectItem(at: newIndex)
+                if !updatedItems.isEmpty {
+                    selectItem(at: selectedIndex)
                 }
             }
         }
@@ -501,6 +568,9 @@ class FlippedView: NSView {
 
 // MARK: - 自定义横向滚动视图（将纵向滚动转为横向）
 class HorizontalScrollView: NSScrollView {
+    /// 滚动后需要按新的可见区间刷新卡片池
+    weak var historyWindowController: HistoryWindowController?
+
     override func scrollWheel(with event: NSEvent) {
         // 将垂直滚动转换为水平滚动
         if abs(event.deltaY) > abs(event.deltaX) {
@@ -522,9 +592,10 @@ class HorizontalScrollView: NSScrollView {
             let maxX = max(0, (self.documentView?.frame.width ?? 0) - self.contentView.bounds.width)
             newOrigin.x = max(0, min(newOrigin.x, maxX))
             newOrigin.y = 0 // 锁定 Y 轴
-            
+
             self.contentView.scroll(to: newOrigin)
             self.reflectScrolledClipView(self.contentView)
+            historyWindowController?.refreshVisibleCards()
             return
         }
         
@@ -538,6 +609,7 @@ class HorizontalScrollView: NSScrollView {
         
         self.contentView.scroll(to: newOrigin)
         self.reflectScrolledClipView(self.contentView)
+        historyWindowController?.refreshVisibleCards()
     }
 }
 
@@ -591,7 +663,9 @@ class ClickThroughView: NSView {
 
 // MARK: - 自定义横向项目视图
 class ClipboardItemView: NSView {
-    private let backgroundView = PassthroughVisualEffectView()
+    /// 背景改成普通 layer 半透明纯色：改前是 NSVisualEffectView 实时毛玻璃，
+    /// 200 张卡片就是 200 个实时 backdrop 层，是 WindowServer/GPU 合成的最大开销来源。
+    private let backgroundView = NSView()
     private let iconImageView = NSImageView()
     private let thumbnailImageView = NSView() // 修改：使用普通 NSView 配合 Layer 显示图片
     private let titleLabel = NSTextField(labelWithString: "")
@@ -605,6 +679,9 @@ class ClipboardItemView: NSView {
     var onClick: ((ClipboardItem) -> Void)?
     // var onDoubleClick: (() -> Void)? // 移除双击
     
+    /// 当前卡片代表的条目下标（池化复用后，一张卡片视图会依次代表不同条目）
+    var index: Int = -1
+
     /// 当前卡片绑定的剪贴板项 ID，用于在外部根据 ID 精确定位/高亮。
     private(set) var itemID: UUID?
     /// 当前卡片绑定的剪贴板项（用于外部根据坐标定位后直接取到正确内容）
@@ -621,17 +698,15 @@ class ClipboardItemView: NSView {
     
     private func setupViews() {
         wantsLayer = true
-        // 外层只负责阴影（不做裁剪），内层 backgroundView 负责毛玻璃+圆角+描边
+        // 外层只负责阴影（不做裁剪），内层 backgroundView 负责圆角+描边+半透明底色
         layer?.shadowColor = NSColor.black.cgColor
         layer?.shadowOpacity = 0.3
         layer?.shadowOffset = CGSize(width: 0, height: -2)
         layer?.shadowRadius = 4
+        updateShadowPath()
 
         backgroundView.frame = bounds
         backgroundView.autoresizingMask = [.width, .height]
-        backgroundView.blendingMode = .withinWindow
-        backgroundView.material = .underWindowBackground
-        backgroundView.state = .active
         backgroundView.wantsLayer = true
         backgroundView.layer?.cornerRadius = 10
         backgroundView.layer?.masksToBounds = true
@@ -689,7 +764,8 @@ class ClipboardItemView: NSView {
         previewLabel.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
         previewLabel.textColor = NSColor(white: 0.7, alpha: 1.0)
         previewLabel.lineBreakMode = .byTruncatingTail
-        previewLabel.maximumNumberOfLines = 0 // 允许多行
+        // 限制行数：改前是 0（不限）＋整段文本，TextKit 要为每条历史布局完整内容
+        previewLabel.maximumNumberOfLines = 6
         previewLabel.isBezeled = false
         previewLabel.drawsBackground = false
         previewLabel.cell?.wraps = true
@@ -703,6 +779,8 @@ class ClipboardItemView: NSView {
         thumbnailImageView.layer?.contentsGravity = .resizeAspectFill
         thumbnailImageView.layer?.masksToBounds = true
         thumbnailImageView.layer?.cornerRadius = 4
+        // 缩略图是降采样后的小图，按屏幕缩放显示，避免 Retina 下发虚
+        thumbnailImageView.layer?.contentsScale = NSScreen.main?.backingScaleFactor ?? 2
         thumbnailImageView.isHidden = true
         addSubview(thumbnailImageView)
         
@@ -716,71 +794,77 @@ class ClipboardItemView: NSView {
         addSubview(timeLabel)
     }
 
+    /// 显式指定阴影路径：否则 Core Animation 要按层内容的 alpha 现算阴影，
+    /// 滚动时每帧都要重算（卡片尺寸只在窗口高度变化时改变，随 bounds 更新即可）
+    private func updateShadowPath() {
+        layer?.shadowPath = CGPath(roundedRect: bounds, cornerWidth: 10, cornerHeight: 10, transform: nil)
+    }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        updateShadowPath()
+    }
+
     func applyCardAppearanceSettings() {
-        // 仅影响卡片背景（毛玻璃）本身，不影响文字/图标
-        backgroundView.alphaValue = AppearanceSettings.cardBackgroundAlpha
+        // 仅影响卡片背景本身，不影响文字/图标；「卡片背景透明度」滑块照旧生效
+        let alpha = AppearanceSettings.cardBackgroundAlpha
+        let background: NSColor = isSelected
+            ? NSColor.systemBlue.withAlphaComponent(0.22 * alpha + 0.08)
+            : NSColor.white.withAlphaComponent(0.12 * alpha)
+        backgroundView.layer?.backgroundColor = background.cgColor
+        backgroundView.layer?.borderColor = (isSelected
+            ? NSColor.systemBlue.withAlphaComponent(0.9)
+            : NSColor.white.withAlphaComponent(0.18)).cgColor
+        backgroundView.layer?.borderWidth = isSelected ? 1.5 : 1.0
     }
     
     func configure(with item: ClipboardItem, index: Int) {
+        self.index = index
         self.itemID = item.id
         self.boundItem = item
         iconImageView.image = item.icon
         titleLabel.stringValue = item.displayText
-        // 保留换行符以便多行显示
-        let previewText = item.previewText
-        previewLabel.stringValue = previewText
+        // 显示用预览文本：超长内容已截断（改前实测最长 7005 字整段塞进多行标签）
+        previewLabel.stringValue = item.previewTextForDisplay
         timeLabel.stringValue = item.formattedTime
-        // indexLabel.stringValue = "\(index + 1)" // 移除序号
-        
+        // 卡片被复用给别的条目时，背景/描边要跟随当前选中态
+        applyCardAppearanceSettings()
+
         // 确保图标位置正确（因为之前可能被修改过）
         let padding: CGFloat = 10
         let headerHeight: CGFloat = 36
         let iconSize: CGFloat = 28
         iconImageView.frame = NSRect(x: padding, y: frame.height - headerHeight + 2, width: iconSize, height: iconSize)
-        
+
         // 如果是图片，调整预览显示
         if item.type == .image {
             previewLabel.isHidden = true
             thumbnailImageView.isHidden = false
-            // 使用 imageData 显示大图预览
-            if let data = item.imageData, let image = NSImage(data: data) {
-                // 使用 layer.contents 配合 resizeAspectFill 实现填充裁剪效果
-                // 必须使用 cgImage 赋值给 layer.contents，NSImage 直接赋值可能无效
-                var imageRect = CGRect(origin: .zero, size: image.size)
-                if let cgImage = image.cgImage(forProposedRect: &imageRect, context: nil, hints: nil) {
-                    thumbnailImageView.layer?.contents = cgImage
-                } else {
-                    thumbnailImageView.layer?.contents = nil
-                }
-            } else {
-                thumbnailImageView.layer?.contents = nil
-            }
+            thumbnailImageView.layer?.contents = nil
+            loadThumbnail(for: item)
         } else {
             previewLabel.isHidden = false
             thumbnailImageView.isHidden = true
+            thumbnailImageView.layer?.contents = nil
+        }
+    }
+
+    /// 缩略图后台生成（ImageIO 降采样），避免在主线程序解码原图；
+    /// 回调时校验卡片是否仍绑定同一条目，防止池化复用后串图。
+    private func loadThumbnail(for item: ClipboardItem) {
+        let itemID = item.id
+        ThumbnailCache.shared.thumbnail(for: item) { [weak self] cgImage in
+            guard let self, self.itemID == itemID else { return }
+            self.thumbnailImageView.layer?.contents = cgImage
         }
     }
     
     func setSelected(_ selected: Bool) {
         isSelected = selected
-        
-        if selected {
-            backgroundView.material = .selection
-            backgroundView.layer?.borderColor = NSColor.systemBlue.withAlphaComponent(0.9).cgColor
-            backgroundView.layer?.borderWidth = 1.5
-            // indexBadge.layer?.backgroundColor = NSColor.white.cgColor
-            // indexLabel.textColor = NSColor.systemBlue
-            titleLabel.textColor = .white
-            previewLabel.textColor = NSColor(white: 0.9, alpha: 1.0)
-        } else {
-            backgroundView.material = .underWindowBackground
-            backgroundView.layer?.borderColor = NSColor.white.withAlphaComponent(0.18).cgColor
-            backgroundView.layer?.borderWidth = 1.0
-            // indexBadge.layer?.backgroundColor = NSColor.systemBlue.withAlphaComponent(0.8).cgColor
-            // indexLabel.textColor = .white
-            titleLabel.textColor = .white
-            previewLabel.textColor = NSColor(white: 0.7, alpha: 1.0)
-        }
+        // 选中态不再切换毛玻璃 material（那会触发 backdrop 重算），改用背景色 + 蓝色描边表达
+        titleLabel.textColor = .white
+        previewLabel.textColor = selected ? NSColor(white: 0.9, alpha: 1.0) : NSColor(white: 0.7, alpha: 1.0)
+        applyCardAppearanceSettings()
     }
 
     // 说明：点击事件已在 ClickThroughView 中统一处理（坐标命中卡片 → 取 boundItem → 粘贴），

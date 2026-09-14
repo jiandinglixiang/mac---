@@ -14,6 +14,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private(set) var lastNonSelfActiveApp: NSRunningApplication?
     private var workspaceActivationObserver: NSObjectProtocol?
     private var featureSettingsObserver: NSObjectProtocol?
+    private var historyDidLoadObserver: NSObjectProtocol?
     
     func applicationDidFinishLaunching(_ notification: Notification) {
         // 设置应用为后台应用（不显示在 Dock）
@@ -60,6 +61,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         
         // 初始化历史窗口
         historyWindow = HistoryWindowController()
+
+        // 历史记录改为后台从磁盘加载：加载完成后若窗口已打开，刷新窗口内容
+        historyDidLoadObserver = NotificationCenter.default.addObserver(
+            forName: .clipboardHistoryDidLoad,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self, let manager = self.clipboardManager else { return }
+            self.historyWindow?.updateItems(manager.history)
+        }
         
         // 设置快捷键
         shortcutManager = KeyboardShortcutManager()
@@ -260,6 +271,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             NSWorkspace.shared.notificationCenter.removeObserver(observer)
         }
         if let observer = featureSettingsObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        if let observer = historyDidLoadObserver {
             NotificationCenter.default.removeObserver(observer)
         }
     }

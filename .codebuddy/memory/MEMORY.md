@@ -8,3 +8,15 @@
 - 风扇控制权会被 `thermalmonitord` 回收（4s/250ms 轮询），靠 `FanSupervisor`（每 5s 只读模式位，被回收才补发）维持。详见 2026-09-01.md。
 - SMC 手动模式不会随睡眠/合盖清除，风扇会一路转到唤醒；因此 `FanSupervisor` 会在合盖（`AppleClamshellState`）或 `willSleep` 时把所有风扇 `auto` 交还系统（阻塞等待），开盖/唤醒后恢复。设置开关 `fanReleaseWhenClosed` 默认开。详见 2026-09-08.md。
 - **风扇处于 SMC 手动/强制模式会阻止 macOS 睡眠**，所以不能只等 `willSleep`（它正因为风扇被强制而不来）→ 必须在**黑屏/锁屏**那一刻就交还控制权。2026-09-09 起 `FanSupervisor` 还监听 `screensDidSleep/Wake`、`sessionDidBecomeActive`、分布式通知 `com.apple.screenIsLocked/Unlocked`；挂起判定 = 合盖 || `CGDisplayIsAsleep(CGMainDisplayID())` || 已锁屏；挂起期间巡检降到 15s。`CGSSessionScreenIsLocked` 已不可用，锁屏只能靠通知。详见 2026-09-09.md。
+
+## 历史窗口渲染与存储架构（2026-09-14 性能重构后，改动前务必遵守）
+- **卡片必须用视图池**：`HistoryWindowController` 只建「可见 + 两侧缓冲」约 16 张 `ClipboardItemView`，滚动时按可见 index 区间复用改内容（`rebuildCardPool()` 重建池 / `refreshVisibleCards()` 刷新区间）。改动前是一次性建 200 张（227 ms、1200 子视图）——**不要再退回全量建视图**。
+- **卡片视图的 `index` 才是它代表的条目下标**，池数组下标与 `items` 不再一一对应；点击命中一律走 `itemAtWindowPoint`（按 frame.contains + `boundItem`），键盘/滚动定位按 index 数学算（`cardX(for:)`）。
+- **卡片背景禁止用 `NSVisualEffectView`**（实时 backdrop 是最大合成开销）：现用 `backgroundView` 普通 layer 半透明纯色（alpha 由 `AppearanceSettings.cardBackgroundAlpha` 映射），选中态靠背景色 + 蓝色描边，阴影必须设 `layer.shadowPath`。
+- **窗口 `hasShadow = false`**（非不透明 + 全宽 + 内容每帧变化会被反复重算窗口阴影）；窗口底层那层全宽 `.behindWindow` 毛玻璃保留（实测已不构成开销）。
+- 图片：`ThumbnailCache`（ImageIO 降采样到 360px、后台队列、NSCache）供 `layer.contents`，**不要**把原图直接塞进 layer；`ClipboardItem.icon` 有缓存（`NSWorkspace.icon(forFile:)` 很贵，卡片复用时不能每次重算）。
+- 预览文本用 `ClipboardItem.previewTextForDisplay`（截断 400 字）+ 标签限 6 行；`formattedTime` 用静态 DateFormatter。
+- **历史持久化走 `HistoryStore`**（文件）：`~/Library/Application Support/剪贴板历史/history.json`（元数据，~55KB）+ `images/<uuid>.dat`（原图）；串行后台队列读写，主线程只交快照；图片经 `ClipboardItem.imageDataLoader` 按需读盘。
+- **绝不要把历史塞回 UserDefaults**：旧版是单个 60MB blob（解码 914ms）。旧数据迁移由 `HistoryStore.migrateFromUserDefaultsIfNeeded` 完成（先写新存储 → 回读校验 id 集合 → 才删旧 key + 落 `hasMigratedHistoryStoreV2`），已完成迁移（200 条）。
+- 性能验收方法（可复现）：临时拿项目源码 + 程序化 `scrollWheel` 驱动窗口，外部每秒采样 `ps -o %cpu= -p 175`（WindowServer）+ `ioreg -r -d 1 -c IOAccelerator -l | sed -n 's/.*"Device Utilization %"=\([0-9]*\).*/\1/p'`（GPU）；干净做法是同进程交替「窗口隐藏 / 可见滚动」对比。2026-09-14 实测：窗口自身只 +1.8 点 WindowServer、GPU 无增长、App 1%。
+- 注意：`ps %cpu` 在本机把 **pid 175 当 WindowServer** 是环境相关假设；采样前先 `ps -A -o pid,comm | grep WindowServer` 确认。
