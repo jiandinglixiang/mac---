@@ -855,7 +855,17 @@ class ClipboardItemView: NSView {
         let itemID = item.id
         ThumbnailCache.shared.thumbnail(for: item) { [weak self] cgImage in
             guard let self, self.itemID == itemID else { return }
-            self.thumbnailImageView.layer?.contents = cgImage
+            if let cgImage {
+                self.thumbnailImageView.layer?.contents = cgImage
+                self.thumbnailImageView.isHidden = false
+                self.previewLabel.isHidden = true
+            } else {
+                // 图片数据读不到（文件缺失/尚未落盘）：退回显示体积文本，避免卡片一片空白
+                self.thumbnailImageView.layer?.contents = nil
+                self.thumbnailImageView.isHidden = true
+                self.previewLabel.isHidden = false
+                self.previewLabel.stringValue = item.previewTextForDisplay
+            }
         }
     }
     

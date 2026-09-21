@@ -88,26 +88,31 @@ final class HistoryStore {
         var records: [Record] = []
         records.reserveCapacity(snapshot.count)
         var pendingImages: [(fileName: String, data: Data)] = []
-        var itemsToRelease: [ClipboardItem] = []
+        var itemsToRelease: [(item: ClipboardItem, fileName: String)] = []
 
         for item in snapshot {
             records.append(makeRecord(from: item))
             guard item.type == .image, let fileName = item.imageFileName else { continue }
             if !fileExists(fileName), let data = item.imageData {
                 pendingImages.append((fileName, data))
-                itemsToRelease.append(item)
+                itemsToRelease.append((item, fileName))
             }
         }
 
         let ids = records.map { $0.id }
         queue.async {
-            guard ids != self.lastWrittenIDs else { return }
+            // 条目集合没变且没有待落盘图片时跳过整次写盘；
+            // 有待落盘图片说明上一次可能写失败（内存副本被保留），这里要重试
+            guard ids != self.lastWrittenIDs || !pendingImages.isEmpty else { return }
             self.lastWrittenIDs = ids
-            self.write(records: records, pendingImages: pendingImages)
+            let written = self.write(records: records, pendingImages: pendingImages)
             guard !itemsToRelease.isEmpty else { return }
-            // 图片已落盘：释放内存副本，历史里的图片统一按需读盘
+            // 只释放「确认落盘成功」的图片内存副本：
+            // 写盘失败时保留内存数据，既不影响本次运行内的显示/粘贴，也能在下次 save 时重试
+            let releasable = itemsToRelease.filter { written.contains($0.fileName) }
+            guard !releasable.isEmpty else { return }
             DispatchQueue.main.async {
-                itemsToRelease.forEach { $0.releaseInMemoryImageData() }
+                releasable.forEach { $0.item.releaseInMemoryImageData() }
             }
         }
     }
@@ -197,21 +202,15 @@ final class HistoryStore {
     }
 
     private func makeItem(from record: Record) -> ClipboardItem {
-        let item = ClipboardItem(id: record.id,
-                                 timestamp: record.timestamp,
-                                 type: record.type,
-                                 textContent: record.textContent,
-                                 imageFileName: record.imageFileName,
-                                 imageByteCount: record.imageByteCount,
-                                 fileURLs: record.fileURLs,
-                                 urlString: record.urlString)
-        if record.imageFileName != nil {
-            item.imageDataLoader = { [weak self] name in
-                guard let self else { return nil }
-                return self.imageData(fileName: name)
-            }
-        }
-        return item
+        // 图片数据不在恢复时加载：ClipboardItem 默认的 imageDataLoader 会在真正需要时读盘
+        return ClipboardItem(id: record.id,
+                             timestamp: record.timestamp,
+                             type: record.type,
+                             textContent: record.textContent,
+                             imageFileName: record.imageFileName,
+                             imageByteCount: record.imageByteCount,
+                             fileURLs: record.fileURLs,
+                             urlString: record.urlString)
     }
 
     private func readRecords() -> [Record] {
@@ -225,12 +224,16 @@ final class HistoryStore {
     }
 
     /// 写盘（仅可在 queue 上调用）
-    private func write(records: [Record], pendingImages: [(fileName: String, data: Data)]) {
+    /// - Returns: 确认写入成功的图片文件名集合（写失败的不会出现在这里，调用方据此决定是否释放内存副本）
+    @discardableResult
+    private func write(records: [Record], pendingImages: [(fileName: String, data: Data)]) -> Set<String> {
         createDirectoriesIfNeeded()
+        var written: Set<String> = []
         for image in pendingImages {
             guard isValidFileName(image.fileName) else { continue }
             do {
                 try image.data.write(to: imagesURL.appendingPathComponent(image.fileName), options: .atomic)
+                written.insert(image.fileName)
             } catch {
                 print("图片写入失败 \(image.fileName)：\(error)")
             }
@@ -241,6 +244,7 @@ final class HistoryStore {
         } catch {
             print("历史元数据写入失败：\(error)")
         }
+        return written
     }
 
     /// 迁移写入：图片落盘 + 元数据落盘（仅可在 queue 上调用）

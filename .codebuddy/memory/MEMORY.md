@@ -17,6 +17,7 @@
 - 图片：`ThumbnailCache`（ImageIO 降采样到 360px、后台队列、NSCache）供 `layer.contents`，**不要**把原图直接塞进 layer；`ClipboardItem.icon` 有缓存（`NSWorkspace.icon(forFile:)` 很贵，卡片复用时不能每次重算）。
 - 预览文本用 `ClipboardItem.previewTextForDisplay`（截断 400 字）+ 标签限 6 行；`formattedTime` 用静态 DateFormatter。
 - **历史持久化走 `HistoryStore`**（文件）：`~/Library/Application Support/剪贴板历史/history.json`（元数据，~55KB）+ `images/<uuid>.dat`（原图）；串行后台队列读写，主线程只交快照；图片经 `ClipboardItem.imageDataLoader` 按需读盘。
+- **图片数据只认「内存副本 or 读盘 loader」两条路，缺一条就整条图片链路死掉**：`imageDataLoader` 必须保留默认实现（`{ HistoryStore.shared.imageData(fileName:) }`），别改回「只有历史条目才注入」——新抓取条目落盘后 `releaseInMemoryImageData()` 会清掉内存副本，没有 loader 时 `imageData` 永久返回 nil（卡片空白 + 粘贴写不进剪贴板，2026-09-21 修的这个 bug）。相应地，`releaseInMemoryImageData()` 只能对「确认写盘成功」的图片调用（`HistoryStore.write` 返回成功文件集合）。
 - **绝不要把历史塞回 UserDefaults**：旧版是单个 60MB blob（解码 914ms）。旧数据迁移由 `HistoryStore.migrateFromUserDefaultsIfNeeded` 完成（先写新存储 → 回读校验 id 集合 → 才删旧 key + 落 `hasMigratedHistoryStoreV2`），已完成迁移（200 条）。
 - 性能验收方法（可复现）：临时拿项目源码 + 程序化 `scrollWheel` 驱动窗口，外部每秒采样 `ps -o %cpu= -p 175`（WindowServer）+ `ioreg -r -d 1 -c IOAccelerator -l | sed -n 's/.*"Device Utilization %"=\([0-9]*\).*/\1/p'`（GPU）；干净做法是同进程交替「窗口隐藏 / 可见滚动」对比。2026-09-14 实测：窗口自身只 +1.8 点 WindowServer、GPU 无增长、App 1%。
 - 注意：`ps %cpu` 在本机把 **pid 175 当 WindowServer** 是环境相关假设；采样前先 `ps -A -o pid,comm | grep WindowServer` 确认。

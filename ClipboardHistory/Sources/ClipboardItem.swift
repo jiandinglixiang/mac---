@@ -27,17 +27,21 @@ final class ClipboardItem: NSObject {
     /// 图片原始字节数：用于卡片体积显示与去重比较，避免为此读磁盘
     var imageByteCount: Int?
 
-    /// 图片数据加载器（由 HistoryStore 注入，从磁盘按需读取），避免历史图片全部常驻内存
-    var imageDataLoader: ((String) -> Data?)?
+    /// 图片数据加载器：默认从 HistoryStore 的 `images/` 目录按需读盘，避免历史图片全部常驻内存。
+    ///
+    /// 必须有默认实现：图片落盘后内存副本会被 `releaseInMemoryImageData()` 释放，
+    /// 新抓取的条目（不像历史条目那样由 HistoryStore 注入 loader）一旦释放就没有数据来源，
+    /// `imageData` 会永久返回 nil —— 表现为卡片不显示缩略图、点粘贴也写不进剪贴板。
+    var imageDataLoader: (String) -> Data? = { HistoryStore.shared.imageData(fileName: $0) }
 
     /// 仅缓存「刚抓取、尚未落盘」的图片数据；历史里的图片一律按需从磁盘读
     private var inMemoryImageData: Data?
 
     var imageData: Data? {
         get {
-            if let data = inMemoryImageData { return data }
-            guard let name = imageFileName, let loader = imageDataLoader else { return nil }
-            return loader(name)
+            if let inMemoryImageData { return inMemoryImageData }
+            guard let name = imageFileName else { return nil }
+            return imageDataLoader(name)
         }
         set {
             inMemoryImageData = newValue
@@ -48,7 +52,8 @@ final class ClipboardItem: NSObject {
         }
     }
 
-    /// 图片已落盘后释放内存副本（历史里的图片统一按需读盘）
+    /// 图片已落盘后释放内存副本（历史里的图片统一按需读盘）。
+    /// 调用方必须先确认文件确实写入成功——释放后只能靠 `imageDataLoader` 读盘恢复。
     func releaseInMemoryImageData() {
         guard imageFileName != nil else { return }
         inMemoryImageData = nil
